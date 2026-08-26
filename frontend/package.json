@@ -1,0 +1,31 @@
+{
+  "name": "jarvis-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "J.A.R.V.I.S. holographic interface - Next.js + React Three Fiber",
+  "scripts": {
+    "dev": "node server.mjs",
+    "build": "next build",
+    "start": "cross-env NODE_ENV=production node server.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@react-three/drei": "^9.114.0",
+    "@react-three/fiber": "^8.17.5",
+    "http-proxy": "^1.18.1",
+    "next": "^14.2.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "three": "^0.168.0",
+    "zustand": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/http-proxy": "^1.17.14",
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@types/three": "^0.168.0",
+    "cross-env": "^7.0.3",
+    "typescript": "^5.5.4"
+  }
+}

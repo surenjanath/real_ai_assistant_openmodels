@@ -1,0 +1,18 @@
+# Full-fat stack for a properly provisioned macOS / Apple Silicon host.
+# Everything here is optional - the backend auto-detects what is importable
+# and degrades gracefully (see README "Hardware optimisation").
+
+# --- Phase 3: Kokoro-82M natural speech -------------------------------------
+# pykokoro is the accelerated re-implementation (LiteRT / Core ML backends can
+# target the Apple Neural Engine, keeping the GPU free for LLM inference).
+pykokoro>=0.1
+# Reference implementation fallback (pip install kokoro>=82M) + wav I/O:
+kokoro>=82M
+soundfile
+
+# --- Phase 5: agentic stack ----------------------------------------------------
+crewai>=0.80
+ollama
+# FastMCP tool server + n8n bridge (backend/tools/mcp_server.py)
+mcp>=1.2
+httpx
