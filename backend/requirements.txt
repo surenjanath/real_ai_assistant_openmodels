@@ -1,0 +1,4 @@
+# J.A.R.V.I.S. backend - core runtime (thin, runs anywhere)
+fastapi>=0.110
+uvicorn[standard]>=0.29
+numpy>=1.26

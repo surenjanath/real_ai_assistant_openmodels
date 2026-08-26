@@ -1,0 +1,50 @@
+{
+  "name": "J.A.R.V.I.S. — Voice Bridge",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "jarvis/speak",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook-1",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "webhookId": "jarvis-speak"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $json.body ?? {};\nconst text = (body.text ?? '').toString().trim();\nif (!text) throw new Error('text required');\nreturn [{ json: { text } }];"
+      },
+      "id": "guard-1",
+      "name": "Validate Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.JARVIS_API }}/api/speak",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"text\": {{ JSON.stringify($json.text).replace(/[\"']/g, '\"') }} }",
+        "options": {}
+      },
+      "id": "http-1",
+      "name": "J.A.R.V.I.S. Speak",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 0]
+    }
+  ],
+  "connections": {
+    "Webhook": { "main": [[{ "node": "Validate Text", "type": "main", "index": 0 }]] },
+    "Validate Text": { "main": [[{ "node": "J.A.R.V.I.S. Speak", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "active": false,
+  "tags": ["jarvis"]
+}

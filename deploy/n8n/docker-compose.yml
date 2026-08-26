@@ -1,0 +1,31 @@
+# n8n automation instance - PRD §4 "Automation & Tooling".
+# The J.A.R.V.I.S. backend (or its FastMCP tool server) triggers n8n
+# workflows; n8n calls back into the assistant via /api/command and /api/speak.
+#
+#   docker compose up -d          -> n8n on http://localhost:5678
+#
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: jarvis-n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - WEBHOOK_URL=http://localhost:5678/
+      - GENERIC_TIMEZONE=UTC
+      # Host networking note: from inside the container reach the backend via
+      # http://host.docker.internal:8000 (add extra_hosts below on Linux).
+      - JARVIS_API=http://host.docker.internal:8000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      # Starter workflow - import via UI: Workflows > Import from File.
+      - ./workflows:/import:ro
+
+volumes:
+  n8n_data:
