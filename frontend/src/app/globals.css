@@ -183,6 +183,30 @@ body {
   border-bottom: 1px solid var(--line);
 }
 
+.telemetry-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.gear {
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 6px;
+  cursor: pointer;
+  transition: color 150ms ease, border-color 150ms ease, transform 300ms ease;
+}
+
+.gear:hover {
+  color: var(--blue);
+  border-color: rgba(94, 176, 255, 0.4);
+  transform: rotate(45deg);
+}
+
 .telemetry-title {
   font-family: var(--mono);
   font-size: 10px;
@@ -341,6 +365,208 @@ body {
 
 .math-formula .pi {
   padding: 0 1px;
+}
+
+/* ---------- settings panel ---------- */
+
+.settings-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 18;
+  background: rgba(2, 4, 8, 0.45);
+  backdrop-filter: blur(2px);
+}
+
+.settings-panel {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 20;
+  width: min(420px, calc(100vw - 40px));
+  background: rgba(8, 11, 16, 0.78);
+  border: 1px solid rgba(94, 176, 255, 0.18);
+  border-radius: 2px;
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6), 0 0 40px rgba(60, 110, 220, 0.08);
+  animation: settings-in 220ms ease;
+}
+
+@keyframes settings-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -47%);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%);
+  }
+}
+
+.settings-close {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+
+.settings-close:hover {
+  color: var(--ink);
+}
+
+.settings-body {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 16px 16px 12px;
+}
+
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.settings-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--dim);
+}
+
+.settings-note {
+  font-style: normal;
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.settings-value {
+  color: var(--blue);
+  font-weight: 600;
+}
+
+.settings-panel select {
+  appearance: none;
+  width: 100%;
+  background: rgba(14, 18, 26, 0.9);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 8px 10px;
+  outline: none;
+  cursor: pointer;
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 16px) 55%, calc(100% - 11px) 55%;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+}
+
+.settings-panel select:focus {
+  border-color: rgba(94, 176, 255, 0.45);
+}
+
+.settings-panel input[type="range"] {
+  width: 100%;
+  height: 2px;
+  appearance: none;
+  -webkit-appearance: none;
+  background: linear-gradient(90deg, rgba(94, 176, 255, 0.6), rgba(94, 176, 255, 0.15));
+  outline: none;
+  cursor: pointer;
+}
+
+.settings-panel input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--blue);
+  box-shadow: 0 0 10px rgba(94, 176, 255, 0.7);
+  cursor: pointer;
+}
+
+.settings-panel input[type="range"]::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: none;
+  border-radius: 50%;
+  background: var(--blue);
+  box-shadow: 0 0 10px rgba(94, 176, 255, 0.7);
+  cursor: pointer;
+}
+
+.settings-scale {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--muted);
+}
+
+.settings-status {
+  display: flex;
+  gap: 14px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.settings-hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--dim);
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.settings-hint i {
+  color: var(--blue);
+  font-style: normal;
+}
+
+.settings-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 16px;
+  border-top: 1px solid var(--line);
+  min-height: 34px;
+}
+
+.settings-save {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.2em;
+}
+
+.settings-save.good {
+  color: var(--green);
+}
+
+.settings-save.bad {
+  color: var(--red);
+}
+
+.settings-detail {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ---------- boot veil ---------- */

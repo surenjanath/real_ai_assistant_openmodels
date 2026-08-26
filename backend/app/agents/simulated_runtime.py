@@ -30,13 +30,14 @@ class SimulatedRuntime:
 
     async def run(self, text: str) -> str:
         bus = self.bus
+        model_note = f" [model {self.model_hint} unverified - ollama offline]" if self.model_hint else ""
         seed = int(hashlib.blake2b(text.encode(), digest_size=3).hexdigest(), 16)
         rng = random.Random(seed)
         topic = _short(text)
         plan = self._plan(text, rng)
 
         await self._step(0.5)
-        bus.publish("info", "agent/router", f"command parsed -> intent '{topic}' confidence 0.{rng.randint(86, 97)}")
+        bus.publish("info", "agent/router", f"command parsed -> intent '{topic}' confidence 0.{rng.randint(86, 97)}{model_note}")
         await self._step(0.4)
         bus.publish("info", "agent/router", "plan: " + " | ".join(plan))
 

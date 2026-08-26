@@ -7,7 +7,7 @@
  */
 
 import { create } from "zustand";
-import type { AssistantStatus, LogLevel, LogLine } from "@/lib/protocol";
+import type { AssistantStatus, LogLevel, LogLine, SettingsState } from "@/lib/protocol";
 
 const MAX_LOGS = 160;
 
@@ -23,6 +23,8 @@ interface JarvisState {
   statusDetail: string;
   logs: LogLine[];
   engines: Engines;
+  settings: SettingsState;
+  settingsOpen: boolean;
   logsConnected: boolean;
   audioConnected: boolean;
   latencyMs: number | null;
@@ -30,6 +32,8 @@ interface JarvisState {
   pushLog: (level: LogLevel, source: string, msg: string) => void;
   setStatus: (status: AssistantStatus, detail?: string) => void;
   setEngines: (engines: Partial<Engines>) => void;
+  setSettings: (settings: Partial<SettingsState>) => void;
+  setSettingsOpen: (open: boolean) => void;
   setConnected: (socket: "logs" | "audio", connected: boolean) => void;
   setLatency: (ms: number | null) => void;
   clearLogs: () => void;
@@ -42,6 +46,15 @@ export const useJarvis = create<JarvisState>((set) => ({
   statusDetail: "",
   logs: [],
   engines: { tts: "…", ttsMode: "", agents: "…", model: "" },
+  settings: {
+    model: "",
+    model_verified: false,
+    models: [],
+    voice: "",
+    voices: [],
+    speed: 1,
+  },
+  settingsOpen: false,
   logsConnected: false,
   audioConnected: false,
   latencyMs: null,
@@ -61,6 +74,11 @@ export const useJarvis = create<JarvisState>((set) => ({
 
   setEngines: (engines) =>
     set((state) => ({ engines: { ...state.engines, ...engines } })),
+
+  setSettings: (settings) =>
+    set((state) => ({ settings: { ...state.settings, ...settings } })),
+
+  setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
 
   setConnected: (socket, connected) =>
     set(socket === "logs" ? { logsConnected: connected } : { audioConnected: connected }),

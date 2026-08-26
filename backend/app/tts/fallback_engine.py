@@ -7,6 +7,9 @@ pipeline (WebSocket streaming -> Web Audio API -> particle sphere) is exercised
 end to end. On a properly provisioned host the Kokoro engine takes over
 automatically.
 
+Voice and speed are mutable: the settings registry hot-swaps them, changing
+pitch and cadence on the very next utterance.
+
 Phonetics: words are split into pseudo-syllables; each syllable is a sum of
 three formant sines on a decaying glottal pitch contour, with noise bursts for
 fricatives and pauses at punctuation. Deterministic per text (hash seeded).
@@ -31,9 +34,8 @@ class FallbackEngine:
     sample_rate = settings.sample_rate
 
     def __init__(self, voice: str | None = None) -> None:
-        self.voice = voice or settings.tts_voice
-        # Male voices (am_/bm_) get a lower fundamental than female (af_/bf_).
-        self._f0 = 128.0 if self.voice.startswith(("am_", "bm_")) else 196.0
+        self.voice = voice or settings.tts_voice      # mutable, registry-controlled
+        self.speed = settings.tts_speed               # mutable, registry-controlled
 
     # -- public API ---------------------------------------------------------
 
@@ -55,8 +57,11 @@ class FallbackEngine:
 
     def _render(self, words: list[str]) -> np.ndarray:
         sr = self.sample_rate
+        speed = max(0.5, min(2.0, float(self.speed)))
         parts: list[np.ndarray] = []
         total_words = max(1, len(words))
+        # Male voices (am_/bm_) get a lower fundamental than female (af_/bf_).
+        f0_base = 128.0 if self.voice.startswith(("am_", "bm_")) else 196.0
 
         for wi, word in enumerate(words):
             seed = int(hashlib.blake2b(word.encode("utf-8"), digest_size=4).hexdigest(), 16)
@@ -64,10 +69,10 @@ class FallbackEngine:
             syllables = self._syllable_count(word)
             # Gentle declination across the utterance, like natural speech.
             progress = wi / total_words
-            f0 = self._f0 * (1.06 - 0.12 * progress)
+            f0 = f0_base * (1.06 - 0.12 * progress)
 
             for si in range(syllables):
-                dur = float(rng.uniform(0.085, 0.165))
+                dur = float(rng.uniform(0.085, 0.165)) / speed
                 n = int(sr * dur)
                 t = np.arange(n) / sr
                 syl_prog = si / max(1, syllables)
@@ -90,7 +95,7 @@ class FallbackEngine:
             # Fricative burst for s/sh/f/x words.
             letters = [c for c in word.lower() if c.isalpha()]
             if letters and letters[-1] in _FRICATIVES:
-                n = int(sr * 0.07)
+                n = int(sr * 0.07 / speed)
                 noise = np.random.default_rng(seed + 7).standard_normal(n)
                 kernel = np.array([1.0, 2.0, 1.0]) / 4.0
                 noise = np.convolve(noise, kernel, mode="same")
@@ -98,11 +103,11 @@ class FallbackEngine:
                 parts.append(noise * env * 0.10)
 
             # Inter-word pause; longer at punctuation.
-            pause = 0.035
+            pause = 0.035 / speed
             if word.endswith((",", ";", ":")):
-                pause = 0.14
+                pause = 0.14 / speed
             elif word.endswith((".", "!", "?", ";")):
-                pause = 0.22
+                pause = 0.22 / speed
             parts.append(np.zeros(int(sr * pause), dtype=np.float32))
 
         audio = np.concatenate(parts) if parts else np.zeros(sr, dtype=np.float32)

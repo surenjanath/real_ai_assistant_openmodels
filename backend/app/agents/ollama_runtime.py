@@ -21,11 +21,14 @@ import json
 import re
 import urllib.error
 import urllib.request
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 from ..config import settings
 from ..logbus import LogBus
 from .base import AgentPersonas, Persona, Runtime
+
+if TYPE_CHECKING:
+    from ..registry import Registry
 
 _SYSTEM_TMPL = (
     "You are {role} on the J.A.R.V.I.S. crew. Goal: {goal}. Backstory: {backstory} "
@@ -77,16 +80,26 @@ def _stream_chat(url: str, payload: dict) -> Iterator[str]:
 class OllamaRuntime:
     name = "ollama"
 
-    def __init__(self, bus: LogBus, base_url: str | None = None, model: str | None = None) -> None:
+    def __init__(self, bus: LogBus, base_url: str | None = None, model: str | None = None,
+                 registry: "Registry | None" = None) -> None:
         self.bus = bus
         self.base_url = (base_url or settings.ollama_base_url).rstrip("/")
-        self.model = model or settings.ollama_model
+        self._static_model = model
+        self.registry = registry
+
+    @property
+    def model(self) -> str:
+        """Current crew model - follows live registry switches."""
+        if self.registry is not None:
+            return self.registry.model
+        return self._static_model or settings.ollama_model
 
     # -- probe -----------------------------------------------------------------
 
     @classmethod
-    async def probe(cls, bus: LogBus, base_url: str | None = None, model: str | None = None) -> "OllamaRuntime | None":
-        runtime = cls(bus, base_url, model)
+    async def probe(cls, bus: LogBus, base_url: str | None = None, model: str | None = None,
+                    registry: "Registry | None" = None) -> "OllamaRuntime | None":
+        runtime = cls(bus, base_url, model, registry)
         ok = await runtime._probe()
         return runtime if ok else None
 
@@ -96,13 +109,21 @@ class OllamaRuntime:
                 _http_json, f"{self.base_url}/api/tags", None, 3.0
             )
             models = [m.get("name", "") for m in info.get("models", [])]
+            if self.registry is not None:
+                for name in models:
+                    if name and name not in self.registry.models:
+                        self.registry.models.append(name)
+                self.registry.models.sort()
+                self.registry.model_verified = self.registry.model in self.registry.models
+                self.registry.broadcast()
             self.bus.publish(
                 "success",
                 "brain",
                 f"ollama online at {self.base_url} - {len(models)} model(s): {', '.join(models[:6]) or 'none'}",
             )
-            if models and not any(m.startswith(self.model.split(':')[0]) for m in models):
-                self.bus.publish("warn", "brain", f"model '{self.model}' not pulled yet - run: ollama pull {self.model}")
+            current = self.model
+            if models and not any(m.startswith(current.split(':')[0]) for m in models):
+                self.bus.publish("warn", "brain", f"model '{current}' not pulled yet - run: ollama pull {current}")
             return True
         except Exception as exc:  # noqa: BLE001
             self.bus.publish("warn", "brain", f"ollama not reachable at {self.base_url} ({type(exc).__name__})")

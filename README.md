@@ -38,23 +38,45 @@ type a directive (e.g. `run a full system diagnostic`) and press Enter — the
 crew runs, reasoning lines stream in, and the answer is spoken back with the
 particle sphere reacting to the audio.
 
+### Settings, model & voice switching
+
+Say (mic button) or type any of these — the settings intents are handled
+directly, before the agent crew:
+
+| Voice command | Effect |
+| --- | --- |
+| `settings` | Opens the settings panel and speaks the current configuration |
+| `list models` | Refreshes the catalogue from Ollama, logs every model, speaks a summary |
+| `switch model to qwen3 8b` | Live-switches the crew model (spoken tag form `qwen3 8b` → `qwen3:8b`; fuzzy-matched, unverified names flagged) |
+| `change voice to af heart` | Hot-swaps the Kokoro voice (applies on the next utterance) |
+| `list voices` | Logs all 28 installed voices |
+| `speak faster` / `speak slower` / `set speed to 1.2` | Adjusts speech rate (0.5–2.0×) |
+| `help` / `status` | Speaks the command reference / engine status |
+
+The ⚙ button in the telemetry header opens the same panel: pick the crew
+model (auto-populated from Ollama `/api/tags` when reachable), the voice, and
+drag the speed slider. Changes `POST /api/settings`, broadcast to every
+connected client as a `settings.update` frame — panel, HUD badge, and voice
+all update instantly, no restart needed.
+
 End-to-end check against a running backend:
 
 ```bash
-make smoke          # verifies /api/health, /ws/logs, command routing, /ws/audio
+make smoke          # health, settings read/write, /ws/logs, command routing, /ws/audio
 ```
 
 ## What runs where
 
 | Subsystem | Location | Notes |
 | --- | --- | --- |
-| Holographic scene | `frontend/src/components/Scene.tsx` | R3F canvas: `IcosahedronGeometry` + `MeshBasicMaterial(wireframe)` cage, fibonacci-`BufferGeometry` + `PointsMaterial` particle sphere, additive glow sprite |
-| State | `frontend/src/state/jarvis.ts` | Zustand for DOM HUD only; audio levels flow through a mutable singleton so log traffic never re-renders the canvas |
-| Web Audio | `frontend/src/audio/engine.ts` | Gapless PCM scheduling, `AnalyserNode` band split (bass/mid/treble) piped into `useFrame` |
+| Holographic scene | `frontend/src/components/Scene.tsx` | R3F canvas: `IcosahedronGeometry` + `MeshBasicMaterial(wireframe)` cage; 4200-point fibonacci `BufferGeometry` sphere with per-frame travelling displacement waves; 24-band FFT ring visualizer; gyroscope rings; orbiting satellites; layered additive glow |
+| State | `frontend/src/state/jarvis.ts` | Zustand for DOM HUD/panels only; audio levels flow through a mutable singleton so log traffic never re-renders the canvas |
+| Web Audio | `frontend/src/audio/engine.ts` | Gapless PCM scheduling, `AnalyserNode` bass/mid/treble + 24 log-spaced spectrum bands + transient kick, piped into `useFrame` |
 | Sockets | `frontend/src/hooks/useJarvisConnection.ts` | `/ws/logs` (telemetry in / commands out), `/ws/audio` (TTS chunks in), auto-reconnect |
+| Settings | `frontend/src/components/SettingsPanel.tsx`, `backend/app/registry.py` | Live model/voice/speed registry; voice commands in `backend/app/intents.py`; `GET/POST /api/settings`; `settings.update` + `ui` frames |
 | Same-origin proxy | `frontend/server.mjs` | Custom Next.js server proxying `/ws/*` + `/api/*` to the backend — no cross-origin browser calls |
 | API layer | `backend/app/main.py` | FastAPI, REST + the two bidirectional WebSockets |
-| Telemetry bus | `backend/app/logbus.py`, `telemetry.py` | Async fan-out with backlog; heartbeat simulator (Phase 2) |
+| Telemetry bus | `backend/app/logbus.py`, `telemetry.py` | Async fan-out with backlog + raw control frames; heartbeat simulator (Phase 2) |
 | Vocal engine | `backend/app/tts/` | `kokoro_engine.py` (pykokoro → kokoro adapter), `fallback_engine.py` (numpy synth), `manager.py` (threaded streaming, b64 PCM frames) |
 | Agent runtime | `backend/app/agents/`, `orchestrator.py` | Ollama probe → live crew (direct or CrewAI) or deterministic simulation; answer routed to TTS |
 | Automation | `backend/tools/mcp_server.py`, `deploy/n8n/` | FastMCP allow-listed tool server + n8n compose & starter workflow |
@@ -125,9 +147,11 @@ See `frontend/src-tauri/README.md`.
 ## WebSocket protocol
 
 `/ws/logs` — client sends `{"type":"command","text":"…","origin":"text|voice"}`
-or `{"type":"ping","ts":<ms>}`; server sends `hello`, `log`
-(`{level: info|voice|success|warn|error, source, msg}` → gray / blue / green /
-amber / red), and `status` (`thinking|speaking|idle`).
+or `{"type":"ping","ts":<ms>}`; server sends `hello` (with a settings
+snapshot), `log` (`{level: info|voice|success|warn|error, source, msg}` →
+gray / blue / green / amber / red), `status` (`thinking|speaking|idle`),
+`settings.update` (after any model/voice/speed change), and `ui`
+(`{action:"open_settings"}` when the user says “settings”).
 
 `/ws/audio` — server sends `tts.start` (engine, voice, sample_rate), `tts.chunk`
 (base64 int16 LE PCM, ~200 ms frames), `tts.end`; client may send

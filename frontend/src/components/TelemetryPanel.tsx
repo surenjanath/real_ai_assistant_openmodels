@@ -79,8 +79,19 @@ export default function TelemetryPanel() {
     <section className="telemetry" data-connected={connected}>
       <header className="telemetry-header">
         <span className="telemetry-title">OPERATIONAL TELEMETRY</span>
-        <span className={`telemetry-link ${connected ? "linked" : ""}`}>
-          {connected ? "LINKED" : "RECONNECTING"}
+        <span className="telemetry-header-actions">
+          <button
+            className="gear"
+            onClick={() => useJarvis.getState().setSettingsOpen(true)}
+            title="Settings (or say “settings”)"
+            aria-label="Open settings"
+            type="button"
+          >
+            ⚙
+          </button>
+          <span className={`telemetry-link ${connected ? "linked" : ""}`}>
+            {connected ? "LINKED" : "RECONNECTING"}
+          </span>
         </span>
       </header>
 

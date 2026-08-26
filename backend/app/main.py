@@ -25,7 +25,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from . import __version__
 from .config import settings
 from .logbus import LogBus, LogEvent
-from .orchestrator import Orchestrator, _StatusSignal
+from .orchestrator import Orchestrator
+from .registry import Registry
 from .telemetry import TelemetrySimulator
 from .tts import build_engine
 from .tts.manager import TTSManager
@@ -34,7 +35,9 @@ _started = time.monotonic()
 _bus = LogBus(backlog_size=settings.log_backlog)
 _engine, _engine_mode = build_engine(_bus)
 _tts = TTSManager(_bus, _engine)
-_orchestrator = Orchestrator(_bus, _tts)
+_registry = Registry(bus=_bus)
+_registry.attach_engine(_engine)
+_orchestrator = Orchestrator(_bus, _tts, _registry)
 _telemetry = TelemetrySimulator(
     _bus,
     client_provider=lambda: len(_bus.subscribers) + _tts.client_count,
@@ -73,11 +76,31 @@ async def health() -> dict[str, Any]:
         "version": __version__,
         "uptime_s": round(time.monotonic() - _started, 1),
         "engines": {
-            "tts": {"name": _engine.name, "mode": _engine_mode, "voice": getattr(_engine, "voice", None)},
-            "agents": {"name": _orchestrator.runtime_name, "model": settings.ollama_model},
+            "tts": {"name": _engine.name, "mode": _engine_mode, "voice": _registry.voice},
+            "agents": {"name": _orchestrator.runtime_name, "model": _registry.model},
         },
         "clients": {"logs": len(_bus.subscribers), "audio": _tts.client_count},
     }
+
+
+@app.get("/api/settings")
+async def get_settings() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "settings": _registry.as_dict(),
+        "engines": {"tts": _engine.name, "tts_mode": _engine_mode, "agents": _orchestrator.runtime_name},
+    }
+
+
+@app.post("/api/settings")
+async def post_settings(payload: dict) -> dict[str, Any]:
+    """Change model / voice / speed from the settings panel (or curl)."""
+    result = _registry.apply(
+        model=payload.get("model"),
+        voice=payload.get("voice"),
+        speed=payload.get("speed"),
+    )
+    return result
 
 
 @app.post("/api/command")
@@ -102,7 +125,7 @@ async def speak(payload: dict) -> dict[str, Any]:
 
 
 def _serialize(item: Any) -> dict | None:
-    if isinstance(item, (LogEvent, _StatusSignal)):
+    if isinstance(item, LogEvent):
         return item.as_dict()
     if isinstance(item, dict):
         return item
@@ -122,8 +145,9 @@ async def ws_logs(ws: WebSocket) -> None:
                 "tts": _engine.name,
                 "tts_mode": _engine_mode,
                 "agents": _orchestrator.runtime_name,
-                "model": settings.ollama_model,
+                "model": _registry.model,
             },
+            "settings": _registry.as_dict(),
         })
         for event in list(_bus.backlog)[-settings.log_backlog:]:
             await ws.send_json(event.as_dict())
@@ -164,7 +188,9 @@ async def _logs_receiver(ws: WebSocket) -> None:
         elif mtype == "speak":
             text = str(message.get("text", "")).strip()
             if text:
-                await _tts.speak(text)
+                # Detached so a disconnect cannot cancel the utterance for
+                # every other connected client.
+                asyncio.create_task(_tts.speak(text))
 
 
 @app.websocket("/ws/audio")
@@ -195,4 +221,6 @@ async def _audio_receiver(ws: WebSocket) -> None:
         if message.get("type") == "speak":
             text = str(message.get("text", "")).strip()
             if text:
-                await _tts.speak(text)
+                # Detached: the utterance is broadcast to every audio client,
+                # so it must survive this particular socket disconnecting.
+                asyncio.create_task(_tts.speak(text))

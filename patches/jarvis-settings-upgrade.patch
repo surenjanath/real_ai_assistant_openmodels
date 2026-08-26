@@ -1,0 +1,2362 @@
+From f6be1af32b348430c87e6aeff8379dd849fdba63 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Wed, 26 Aug 2026 23:16:32 +0000
+Subject: [PATCH] feat: settings system with voice control + live model/voice
+ switching; hyper-reactive hologram
+
+Backend:
+- app/registry.py: live settings registry (crew model, Kokoro voice, speech
+  speed) with Ollama tag discovery, fuzzy spoken-name resolution ("qwen3 8b"
+  -> qwen3:8b), engine hot-swap mirroring, settings.update broadcasts
+- app/intents.py: NL intent parser checked before the crew - settings,
+  list models/voices, switch model/voice, speak faster/slower, set speed,
+  help, status
+- orchestrator handles intents inline with spoken confirmations + ui frames
+  (open_settings); OllamaRuntime reads the model per-run
+- GET/POST /api/settings; hello frame carries a settings snapshot
+- TTS fixes: producer threads halt promptly on cancel (threading.Event +
+  safe_put, no more QueueFull spam); client-initiated speak survives that
+  client disconnecting; smoke test tracks its own utterance id
+
+Frontend:
+- SettingsPanel: model select (auto-populated), voice select, speed slider,
+  POSTs /api/settings, syncs via settings.update frames; opens via gear
+  button or by saying "settings"
+- Scene: 4200-pt sphere with per-point travelling displacement waves,
+  24-band FFT ring visualizer, gyroscope rings, orbiting satellites,
+  layered glow, kick transient on utterance start, hotter sensitivity
+- HUD model badge follows live model switches
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ README.md                                  |  40 ++-
+ backend/app/__init__.py                    |   2 +-
+ backend/app/agents/ollama_runtime.py       |  35 +-
+ backend/app/agents/simulated_runtime.py    |   3 +-
+ backend/app/intents.py                     |  77 +++++
+ backend/app/logbus.py                      |  13 +
+ backend/app/main.py                        |  44 ++-
+ backend/app/orchestrator.py                | 157 +++++++--
+ backend/app/registry.py                    | 189 ++++++++++
+ backend/app/tts/fallback_engine.py         |  23 +-
+ backend/app/tts/kokoro_engine.py           |   5 +-
+ backend/app/tts/manager.py                 |  23 +-
+ backend/scripts/smoke.py                   |  39 ++-
+ frontend/src/app/globals.css               | 226 ++++++++++++
+ frontend/src/audio/engine.ts               |  56 ++-
+ frontend/src/audio/levels.ts               |   8 +
+ frontend/src/components/JarvisApp.tsx      |   2 +
+ frontend/src/components/Scene.tsx          | 382 +++++++++++++++++----
+ frontend/src/components/SettingsPanel.tsx  | 169 +++++++++
+ frontend/src/components/TelemetryPanel.tsx |  15 +-
+ frontend/src/hooks/useJarvisConnection.ts  |  20 ++
+ frontend/src/lib/protocol.ts               |  28 +-
+ frontend/src/state/jarvis.ts               |  20 +-
+ 23 files changed, 1435 insertions(+), 141 deletions(-)
+ create mode 100644 backend/app/intents.py
+ create mode 100644 backend/app/registry.py
+ create mode 100644 frontend/src/components/SettingsPanel.tsx
+
+diff --git a/README.md b/README.md
+index 6888d45..ce44368 100644
+--- a/README.md
++++ b/README.md
+@@ -38,23 +38,45 @@ type a directive (e.g. `run a full system diagnostic`) and press Enter — the
+ crew runs, reasoning lines stream in, and the answer is spoken back with the
+ particle sphere reacting to the audio.
+ 
++### Settings, model & voice switching
++
++Say (mic button) or type any of these — the settings intents are handled
++directly, before the agent crew:
++
++| Voice command | Effect |
++| --- | --- |
++| `settings` | Opens the settings panel and speaks the current configuration |
++| `list models` | Refreshes the catalogue from Ollama, logs every model, speaks a summary |
++| `switch model to qwen3 8b` | Live-switches the crew model (spoken tag form `qwen3 8b` → `qwen3:8b`; fuzzy-matched, unverified names flagged) |
++| `change voice to af heart` | Hot-swaps the Kokoro voice (applies on the next utterance) |
++| `list voices` | Logs all 28 installed voices |
++| `speak faster` / `speak slower` / `set speed to 1.2` | Adjusts speech rate (0.5–2.0×) |
++| `help` / `status` | Speaks the command reference / engine status |
++
++The ⚙ button in the telemetry header opens the same panel: pick the crew
++model (auto-populated from Ollama `/api/tags` when reachable), the voice, and
++drag the speed slider. Changes `POST /api/settings`, broadcast to every
++connected client as a `settings.update` frame — panel, HUD badge, and voice
++all update instantly, no restart needed.
++
+ End-to-end check against a running backend:
+ 
+ ```bash
+-make smoke          # verifies /api/health, /ws/logs, command routing, /ws/audio
++make smoke          # health, settings read/write, /ws/logs, command routing, /ws/audio
+ ```
+ 
+ ## What runs where
+ 
+ | Subsystem | Location | Notes |
+ | --- | --- | --- |
+-| Holographic scene | `frontend/src/components/Scene.tsx` | R3F canvas: `IcosahedronGeometry` + `MeshBasicMaterial(wireframe)` cage, fibonacci-`BufferGeometry` + `PointsMaterial` particle sphere, additive glow sprite |
+-| State | `frontend/src/state/jarvis.ts` | Zustand for DOM HUD only; audio levels flow through a mutable singleton so log traffic never re-renders the canvas |
+-| Web Audio | `frontend/src/audio/engine.ts` | Gapless PCM scheduling, `AnalyserNode` band split (bass/mid/treble) piped into `useFrame` |
++| Holographic scene | `frontend/src/components/Scene.tsx` | R3F canvas: `IcosahedronGeometry` + `MeshBasicMaterial(wireframe)` cage; 4200-point fibonacci `BufferGeometry` sphere with per-frame travelling displacement waves; 24-band FFT ring visualizer; gyroscope rings; orbiting satellites; layered additive glow |
++| State | `frontend/src/state/jarvis.ts` | Zustand for DOM HUD/panels only; audio levels flow through a mutable singleton so log traffic never re-renders the canvas |
++| Web Audio | `frontend/src/audio/engine.ts` | Gapless PCM scheduling, `AnalyserNode` bass/mid/treble + 24 log-spaced spectrum bands + transient kick, piped into `useFrame` |
+ | Sockets | `frontend/src/hooks/useJarvisConnection.ts` | `/ws/logs` (telemetry in / commands out), `/ws/audio` (TTS chunks in), auto-reconnect |
++| Settings | `frontend/src/components/SettingsPanel.tsx`, `backend/app/registry.py` | Live model/voice/speed registry; voice commands in `backend/app/intents.py`; `GET/POST /api/settings`; `settings.update` + `ui` frames |
+ | Same-origin proxy | `frontend/server.mjs` | Custom Next.js server proxying `/ws/*` + `/api/*` to the backend — no cross-origin browser calls |
+ | API layer | `backend/app/main.py` | FastAPI, REST + the two bidirectional WebSockets |
+-| Telemetry bus | `backend/app/logbus.py`, `telemetry.py` | Async fan-out with backlog; heartbeat simulator (Phase 2) |
++| Telemetry bus | `backend/app/logbus.py`, `telemetry.py` | Async fan-out with backlog + raw control frames; heartbeat simulator (Phase 2) |
+ | Vocal engine | `backend/app/tts/` | `kokoro_engine.py` (pykokoro → kokoro adapter), `fallback_engine.py` (numpy synth), `manager.py` (threaded streaming, b64 PCM frames) |
+ | Agent runtime | `backend/app/agents/`, `orchestrator.py` | Ollama probe → live crew (direct or CrewAI) or deterministic simulation; answer routed to TTS |
+ | Automation | `backend/tools/mcp_server.py`, `deploy/n8n/` | FastMCP allow-listed tool server + n8n compose & starter workflow |
+@@ -125,9 +147,11 @@ See `frontend/src-tauri/README.md`.
+ ## WebSocket protocol
+ 
+ `/ws/logs` — client sends `{"type":"command","text":"…","origin":"text|voice"}`
+-or `{"type":"ping","ts":<ms>}`; server sends `hello`, `log`
+-(`{level: info|voice|success|warn|error, source, msg}` → gray / blue / green /
+-amber / red), and `status` (`thinking|speaking|idle`).
++or `{"type":"ping","ts":<ms>}`; server sends `hello` (with a settings
++snapshot), `log` (`{level: info|voice|success|warn|error, source, msg}` →
++gray / blue / green / amber / red), `status` (`thinking|speaking|idle`),
++`settings.update` (after any model/voice/speed change), and `ui`
++(`{action:"open_settings"}` when the user says “settings”).
+ 
+ `/ws/audio` — server sends `tts.start` (engine, voice, sample_rate), `tts.chunk`
+ (base64 int16 LE PCM, ~200 ms frames), `tts.end`; client may send
+diff --git a/backend/app/__init__.py b/backend/app/__init__.py
+index 6271234..1bde022 100644
+--- a/backend/app/__init__.py
++++ b/backend/app/__init__.py
+@@ -1,3 +1,3 @@
+ """J.A.R.V.I.S. backend package."""
+ 
+-__version__ = "1.0.0"
++__version__ = "1.1.0"
+diff --git a/backend/app/agents/ollama_runtime.py b/backend/app/agents/ollama_runtime.py
+index 2c3ca10..7b7b60d 100644
+--- a/backend/app/agents/ollama_runtime.py
++++ b/backend/app/agents/ollama_runtime.py
+@@ -21,12 +21,15 @@ import json
+ import re
+ import urllib.error
+ import urllib.request
+-from typing import Any, Iterator
++from typing import TYPE_CHECKING, Any, Iterator
+ 
+ from ..config import settings
+ from ..logbus import LogBus
+ from .base import AgentPersonas, Persona, Runtime
+ 
++if TYPE_CHECKING:
++    from ..registry import Registry
++
+ _SYSTEM_TMPL = (
+     "You are {role} on the J.A.R.V.I.S. crew. Goal: {goal}. Backstory: {backstory} "
+     "Answer in at most 6 short lines. No markdown, no preamble, no sign-off."
+@@ -77,16 +80,26 @@ def _stream_chat(url: str, payload: dict) -> Iterator[str]:
+ class OllamaRuntime:
+     name = "ollama"
+ 
+-    def __init__(self, bus: LogBus, base_url: str | None = None, model: str | None = None) -> None:
++    def __init__(self, bus: LogBus, base_url: str | None = None, model: str | None = None,
++                 registry: "Registry | None" = None) -> None:
+         self.bus = bus
+         self.base_url = (base_url or settings.ollama_base_url).rstrip("/")
+-        self.model = model or settings.ollama_model
++        self._static_model = model
++        self.registry = registry
++
++    @property
++    def model(self) -> str:
++        """Current crew model - follows live registry switches."""
++        if self.registry is not None:
++            return self.registry.model
++        return self._static_model or settings.ollama_model
+ 
+     # -- probe -----------------------------------------------------------------
+ 
+     @classmethod
+-    async def probe(cls, bus: LogBus, base_url: str | None = None, model: str | None = None) -> "OllamaRuntime | None":
+-        runtime = cls(bus, base_url, model)
++    async def probe(cls, bus: LogBus, base_url: str | None = None, model: str | None = None,
++                    registry: "Registry | None" = None) -> "OllamaRuntime | None":
++        runtime = cls(bus, base_url, model, registry)
+         ok = await runtime._probe()
+         return runtime if ok else None
+ 
+@@ -96,13 +109,21 @@ class OllamaRuntime:
+                 _http_json, f"{self.base_url}/api/tags", None, 3.0
+             )
+             models = [m.get("name", "") for m in info.get("models", [])]
++            if self.registry is not None:
++                for name in models:
++                    if name and name not in self.registry.models:
++                        self.registry.models.append(name)
++                self.registry.models.sort()
++                self.registry.model_verified = self.registry.model in self.registry.models
++                self.registry.broadcast()
+             self.bus.publish(
+                 "success",
+                 "brain",
+                 f"ollama online at {self.base_url} - {len(models)} model(s): {', '.join(models[:6]) or 'none'}",
+             )
+-            if models and not any(m.startswith(self.model.split(':')[0]) for m in models):
+-                self.bus.publish("warn", "brain", f"model '{self.model}' not pulled yet - run: ollama pull {self.model}")
++            current = self.model
++            if models and not any(m.startswith(current.split(':')[0]) for m in models):
++                self.bus.publish("warn", "brain", f"model '{current}' not pulled yet - run: ollama pull {current}")
+             return True
+         except Exception as exc:  # noqa: BLE001
+             self.bus.publish("warn", "brain", f"ollama not reachable at {self.base_url} ({type(exc).__name__})")
+diff --git a/backend/app/agents/simulated_runtime.py b/backend/app/agents/simulated_runtime.py
+index 0ebd3a3..9ee6c40 100644
+--- a/backend/app/agents/simulated_runtime.py
++++ b/backend/app/agents/simulated_runtime.py
+@@ -30,13 +30,14 @@ class SimulatedRuntime:
+ 
+     async def run(self, text: str) -> str:
+         bus = self.bus
++        model_note = f" [model {self.model_hint} unverified - ollama offline]" if self.model_hint else ""
+         seed = int(hashlib.blake2b(text.encode(), digest_size=3).hexdigest(), 16)
+         rng = random.Random(seed)
+         topic = _short(text)
+         plan = self._plan(text, rng)
+ 
+         await self._step(0.5)
+-        bus.publish("info", "agent/router", f"command parsed -> intent '{topic}' confidence 0.{rng.randint(86, 97)}")
++        bus.publish("info", "agent/router", f"command parsed -> intent '{topic}' confidence 0.{rng.randint(86, 97)}{model_note}")
+         await self._step(0.4)
+         bus.publish("info", "agent/router", "plan: " + " | ".join(plan))
+ 
+diff --git a/backend/app/intents.py b/backend/app/intents.py
+new file mode 100644
+index 0000000..afa9f0f
+--- /dev/null
++++ b/backend/app/intents.py
+@@ -0,0 +1,77 @@
++"""Natural-language settings intents, checked before the agent crew runs.
++
++Lets the user speak or type things like:
++
++    settings / open settings
++    list models / what models do you have
++    switch model to qwen3 8b        (spoken form of qwen3:8b)
++    change voice to af_heart
++    speak slower / faster / set speed to 1.2
++    list voices
++    help
++    status
++
++Anything that does not match falls through to the crew unchanged.
++"""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++
++
++@dataclass(frozen=True)
++class Intent:
++    kind: str
++    value: str | None = None
++    raw: str | None = None
++
++
++def _norm(text: str) -> str:
++    return re.sub(r"\s+", " ", text.strip().lower())
++
++
++_MODELS = r"(models?|llms?)"
++_VOICES = r"(voices?|narrators?)"
++
++
++def parse_intent(text: str) -> Intent | None:
++    t = _norm(text)
++
++    if t in ("settings", "open settings", "show settings", "configuration",
++             "preferences", "settings panel", "system settings"):
++        return Intent("settings_show")
++
++    if re.fullmatch(r"(help|commands|what can you do\??)", t):
++        return Intent("help")
++
++    if re.fullmatch(r"(status|system status|report status)", t):
++        return Intent("status")
++
++    if re.search(rf"^(list|show|enumerate|which|what).{{0,16}}{_MODELS}", t) or re.fullmatch(_MODELS, t):
++        return Intent("models_list")
++    if re.search(rf"^(list|show|enumerate|which|what).{{0,16}}{_VOICES}", t):
++        return Intent("voices_list")
++
++    match = re.search(
++        rf"(?:switch|change|use|set|load|make)\s+(?:the\s+)?{_MODELS}\s+(?:to|as|is|:)?\s*([\w.\-: ]+)$", t
++    )
++    if match:
++        return Intent("model_set", value=match.group(2).strip(), raw=t)
++
++    match = re.search(
++        rf"(?:switch|change|use|set|load|make)\s+(?:the\s+)?{_VOICES}\s+(?:to|as|is|:)?\s*([\w.\-: ]+)$", t
++    )
++    if match:
++        return Intent("voice_set", value=match.group(2).strip(), raw=t)
++
++    match = re.search(r"(?:set|change|adjust)\s+(?:the\s+)?speed\s+(?:to|at|is|:)?\s*([0-9]*\.?[0-9]+)", t)
++    if match:
++        return Intent("speed_set", value=match.group(1))
++
++    if re.search(r"\b(speak |talk |read )?(faster|speed up|quicker)\b", t):
++        return Intent("speed_up")
++    if re.search(r"\b(speak |talk |read )?(slower|slow down)\b", t):
++        return Intent("speed_down")
++
++    return None
+diff --git a/backend/app/logbus.py b/backend/app/logbus.py
+index 4b2a7e7..1a8f11a 100644
+--- a/backend/app/logbus.py
++++ b/backend/app/logbus.py
+@@ -82,6 +82,19 @@ class LogBus:
+             "ts": time.time(),
+         }
+ 
++    def push_frame(self, frame: dict[str, Any]) -> None:
++        """Push an arbitrary JSON frame (status / settings / ui control) to
++        every telemetry subscriber, bypassing the log backlog."""
++        for q in list(self.subscribers):
++            try:
++                q.put_nowait(frame)
++            except asyncio.QueueFull:
++                try:
++                    q.get_nowait()
++                    q.put_nowait(frame)
++                except Exception:  # pragma: no cover - defensive
++                    pass
++
+     async def events(self, q: asyncio.Queue) -> AsyncIterator[LogEvent]:
+         while True:
+             yield await q.get()
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 6213ca1..44314b7 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -25,7 +25,8 @@ from fastapi.middleware.cors import CORSMiddleware
+ from . import __version__
+ from .config import settings
+ from .logbus import LogBus, LogEvent
+-from .orchestrator import Orchestrator, _StatusSignal
++from .orchestrator import Orchestrator
++from .registry import Registry
+ from .telemetry import TelemetrySimulator
+ from .tts import build_engine
+ from .tts.manager import TTSManager
+@@ -34,7 +35,9 @@ _started = time.monotonic()
+ _bus = LogBus(backlog_size=settings.log_backlog)
+ _engine, _engine_mode = build_engine(_bus)
+ _tts = TTSManager(_bus, _engine)
+-_orchestrator = Orchestrator(_bus, _tts)
++_registry = Registry(bus=_bus)
++_registry.attach_engine(_engine)
++_orchestrator = Orchestrator(_bus, _tts, _registry)
+ _telemetry = TelemetrySimulator(
+     _bus,
+     client_provider=lambda: len(_bus.subscribers) + _tts.client_count,
+@@ -73,13 +76,33 @@ async def health() -> dict[str, Any]:
+         "version": __version__,
+         "uptime_s": round(time.monotonic() - _started, 1),
+         "engines": {
+-            "tts": {"name": _engine.name, "mode": _engine_mode, "voice": getattr(_engine, "voice", None)},
+-            "agents": {"name": _orchestrator.runtime_name, "model": settings.ollama_model},
++            "tts": {"name": _engine.name, "mode": _engine_mode, "voice": _registry.voice},
++            "agents": {"name": _orchestrator.runtime_name, "model": _registry.model},
+         },
+         "clients": {"logs": len(_bus.subscribers), "audio": _tts.client_count},
+     }
+ 
+ 
++@app.get("/api/settings")
++async def get_settings() -> dict[str, Any]:
++    return {
++        "ok": True,
++        "settings": _registry.as_dict(),
++        "engines": {"tts": _engine.name, "tts_mode": _engine_mode, "agents": _orchestrator.runtime_name},
++    }
++
++
++@app.post("/api/settings")
++async def post_settings(payload: dict) -> dict[str, Any]:
++    """Change model / voice / speed from the settings panel (or curl)."""
++    result = _registry.apply(
++        model=payload.get("model"),
++        voice=payload.get("voice"),
++        speed=payload.get("speed"),
++    )
++    return result
++
++
+ @app.post("/api/command")
+ async def command(payload: dict) -> dict[str, Any]:
+     text = str(payload.get("text", "")).strip()
+@@ -102,7 +125,7 @@ async def speak(payload: dict) -> dict[str, Any]:
+ 
+ 
+ def _serialize(item: Any) -> dict | None:
+-    if isinstance(item, (LogEvent, _StatusSignal)):
++    if isinstance(item, LogEvent):
+         return item.as_dict()
+     if isinstance(item, dict):
+         return item
+@@ -122,8 +145,9 @@ async def ws_logs(ws: WebSocket) -> None:
+                 "tts": _engine.name,
+                 "tts_mode": _engine_mode,
+                 "agents": _orchestrator.runtime_name,
+-                "model": settings.ollama_model,
++                "model": _registry.model,
+             },
++            "settings": _registry.as_dict(),
+         })
+         for event in list(_bus.backlog)[-settings.log_backlog:]:
+             await ws.send_json(event.as_dict())
+@@ -164,7 +188,9 @@ async def _logs_receiver(ws: WebSocket) -> None:
+         elif mtype == "speak":
+             text = str(message.get("text", "")).strip()
+             if text:
+-                await _tts.speak(text)
++                # Detached so a disconnect cannot cancel the utterance for
++                # every other connected client.
++                asyncio.create_task(_tts.speak(text))
+ 
+ 
+ @app.websocket("/ws/audio")
+@@ -195,4 +221,6 @@ async def _audio_receiver(ws: WebSocket) -> None:
+         if message.get("type") == "speak":
+             text = str(message.get("text", "")).strip()
+             if text:
+-                await _tts.speak(text)
++                # Detached: the utterance is broadcast to every audio client,
++                # so it must survive this particular socket disconnecting.
++                asyncio.create_task(_tts.speak(text))
+diff --git a/backend/app/orchestrator.py b/backend/app/orchestrator.py
+index 9b1b486..2b5d7ca 100644
+--- a/backend/app/orchestrator.py
++++ b/backend/app/orchestrator.py
+@@ -1,8 +1,11 @@
+-"""Command orchestrator: STT/typed command -> agent crew -> voice engine.
++"""Command orchestrator: command -> (settings intent | agent crew) -> voice.
+ 
+-This is the nervous-system glue mandated by PRD §4 - it routes a command into
+-the agentic runtime (Ollama/CrewAI when available, simulation otherwise),
+-streams every reasoning step to the telemetry bus, then hands the final answer
++Routing order per command:
++  1. settings/help/status intents  - handled inline (registry changes, UI
++     control frames, spoken confirmations)
++  2. otherwise the agent crew runs (Ollama/CrewAI live, or simulation)
++
++Every reasoning step streams to the telemetry bus; the final answer is handed
+ to the TTS manager so it is spoken and rendered on the holographic interface.
+ """
+ 
+@@ -15,23 +18,33 @@ from .agents.base import Runtime
+ from .agents.ollama_runtime import OllamaRuntime
+ from .agents.simulated_runtime import SimulatedRuntime
+ from .config import settings
++from .intents import Intent, parse_intent
+ from .logbus import LogBus
++from .registry import Registry
+ from .tts.manager import TTSManager
+ 
++_HELP_TEXT = (
++    "You can give me any directive, or say: settings to open the panel; "
++    "list models; switch model to a name; change voice to a name; "
++    "or speak faster and slower."
++)
++
+ 
+ class Orchestrator:
+-    def __init__(self, bus: LogBus, tts: TTSManager) -> None:
++    def __init__(self, bus: LogBus, tts: TTSManager, registry: Registry) -> None:
+         self.bus = bus
+         self.tts = tts
++        self.registry = registry
+         self.runtime: Runtime | None = None
+         self._lock = asyncio.Lock()  # serialise workflows - one crew at a time
+         self._worker: asyncio.Task | None = None
+         self._queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=16)
+ 
+     async def start(self) -> None:
+-        runtime = await OllamaRuntime.probe(self.bus)
++        await self.registry.refresh_models()
++        runtime = await OllamaRuntime.probe(self.bus, registry=self.registry)
+         if runtime is None:
+-            runtime = SimulatedRuntime(self.bus, model_hint=settings.ollama_model)
++            runtime = SimulatedRuntime(self.bus, model_hint=self.registry.model)
+             self.bus.publish(
+                 "warn",
+                 "brain",
+@@ -65,10 +78,18 @@ class Orchestrator:
+         if not text:
+             return
+         async with self._lock:
+-            started = time.monotonic()
+             source = "stt" if origin == "voice" else "router"
+             self.bus.publish("voice" if origin == "voice" else "info", source, f'"{text}"')
++
++            intent = parse_intent(text)
++            if intent is not None:
++                await self._handle_intent(intent)
++                return
++
++            started = time.monotonic()
+             self._broadcast_status("thinking", text)
++            if isinstance(self.runtime, SimulatedRuntime):
++                self.runtime.model_hint = self.registry.model
+             try:
+                 answer = await self.runtime.run(text)
+             except Exception as exc:  # noqa: BLE001
+@@ -82,23 +103,115 @@ class Orchestrator:
+             await self.tts.speak(answer)
+             self._broadcast_status("idle")
+ 
+-    def _broadcast_status(self, status: str, detail: str = "") -> None:
+-        # Status events ride the same log socket as a dedicated message type.
+-        for q in list(self.bus.subscribers):
++    # ------------------------------------------------------------------ intents
++
++    async def _handle_intent(self, intent: Intent) -> None:
++        bus, registry, tts = self.bus, self.registry, self.tts
++        kind = intent.kind
++
++        if kind == "settings_show":
++            bus.push_frame({"type": "ui", "action": "open_settings"})
++            self._broadcast_status("speaking")
++            await tts.speak(
++                f"Settings panel open. Current model {registry.model}, "
++                f"voice {registry.voice}, speed {registry.speed:.1f}. "
++                "Choose a model or voice from the panel, or tell me to switch."
++            )
++            self._broadcast_status("idle")
++            return
++
++        if kind == "models_list":
++            await registry.refresh_models()
++            bus.publish("info", "settings", f"{len(registry.models)} models available:")
++            for model in registry.models:
++                marker = " ●" if model == registry.model else ""
++                bus.publish("info", "settings", f"  {model}{marker}")
++            names = ", ".join(registry.models[:6])
++            more = f", and {len(registry.models) - 6} more" if len(registry.models) > 6 else ""
++            self._broadcast_status("speaking")
++            await tts.speak(f"Available models include: {names}{more}. Currently using {registry.model}.")
++            self._broadcast_status("idle")
++            return
++
++        if kind == "voices_list":
++            bus.publish("info", "settings", f"{len(registry.voices)} voices installed:")
++            for voice in registry.voices:
++                marker = " ●" if voice == registry.voice else ""
++                bus.publish("info", "settings", f"  {voice}{marker}")
++            self._broadcast_status("speaking")
++            await tts.speak(f"I can speak with {len(registry.voices)} voices, currently {registry.voice}. Say change voice to, followed by a name.")
++            self._broadcast_status("idle")
++            return
++
++        if kind == "model_set" and intent.value:
++            result = registry.apply(model=intent.value)
++            if result["applied"]:
++                await registry.refresh_models()
++                await self._confirm(
++                    f"Model switched to {self.registry.model}. "
++                    + ("" if self.registry.model_verified else "Note: not yet present on the Ollama server; pull it if needed.")
++                )
++            else:
++                await self._deny(result["errors"][0] if result["errors"] else "model unchanged")
++            return
++
++        if kind == "voice_set" and intent.value:
++            result = registry.apply(voice=intent.value)
++            if result["applied"]:
++                await self._confirm(
++                    f"Voice switched to {self.registry.voice}. Listening test: "
++                    "all systems nominal, and sounding rather different, I trust."
++                )
++            else:
++                await self._deny(result["errors"][0] if result["errors"] else "voice unchanged")
++            return
++
++        if kind == "speed_up":
++            before = registry.speed
++            registry.apply(speed=round(min(2.0, before + 0.15), 2))
++            await self._confirm(f"Speaking faster: speed {registry.speed:.2f}.")
++            return
++
++        if kind == "speed_down":
++            before = registry.speed
++            registry.apply(speed=round(max(0.5, before - 0.15), 2))
++            await self._confirm(f"Speaking slower: speed {registry.speed:.2f}.")
++            return
++
++        if kind == "speed_set" and intent.value:
+             try:
+-                q.put_nowait(_StatusSignal(status, detail))  # type: ignore[arg-type]
+-            except asyncio.QueueFull:
+-                pass
++                result = registry.apply(speed=float(intent.value))
++            except ValueError:
++                await self._deny(f"could not parse speed '{intent.value}'")
++                return
++            await self._confirm(f"Speed set to {registry.speed:.2f}.")
++            return
++
++        if kind == "help":
++            await self._confirm(_HELP_TEXT)
++            return
+ 
++        if kind == "status":
++            await self._confirm(
++                f"Status: voice engine {self.tts.engine.name}, crew {self.runtime_name} on {registry.model}, "
++                f"model {'verified' if registry.model_verified else 'unverified'}. All primary systems nominal."
++            )
++            return
+ 
+-class _StatusSignal:
+-    """Marker object pushed onto log queues; main.py serialises it to JSON."""
++        # Unhandled intent kind - fall through to a helpful denial.
++        await self._deny("that settings command is not recognised. Say help for options.")
+ 
+-    __slots__ = ("status", "detail")
++    async def _confirm(self, text: str) -> None:
++        self.bus.publish("voice", "settings", text)
++        self._broadcast_status("speaking")
++        await self.tts.speak(text)
++        self._broadcast_status("idle")
+ 
+-    def __init__(self, status: str, detail: str) -> None:
+-        self.status = status
+-        self.detail = detail
++    async def _deny(self, text: str) -> None:
++        self.bus.publish("error", "settings", text)
++        self._broadcast_status("speaking")
++        await self.tts.speak(text)
++        self._broadcast_status("idle")
+ 
+-    def as_dict(self) -> dict:
+-        return {"type": "status", "status": self.status, "detail": self.detail}
++    def _broadcast_status(self, status: str, detail: str = "") -> None:
++        self.bus.push_frame({"type": "status", "status": status, "detail": detail})
+diff --git a/backend/app/registry.py b/backend/app/registry.py
+new file mode 100644
+index 0000000..a04e11b
+--- /dev/null
++++ b/backend/app/registry.py
+@@ -0,0 +1,189 @@
++"""Runtime settings registry: model / voice / speed, switchable live.
++
++Sources of truth:
++  * models  - discovered from Ollama /api/tags when reachable, merged with a
++              sensible default catalogue (so switching works even before
++              Ollama is up; unverified names are accepted but flagged).
++  * voices  - the Kokoro-82M v1.0 voice set.
++Every change is broadcast to all telemetry clients as a `settings.update`
++frame and mirrored onto the live TTS engine, so voice/speed changes are
++audible on the very next utterance without a restart.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import re
++import urllib.request
++from dataclasses import dataclass, field
++
++from .config import settings
++from .logbus import LogBus
++
++DEFAULT_MODELS = [
++    "llama3.1:8b",
++    "llama3.2:3b",
++    "qwen3:8b",
++    "qwen2.5:7b",
++    "qwen3:30b-a3b",
++    "mistral-nemo:12b",
++    "gemma3:12b",
++    "phi4-mini:3.8b",
++    "deepseek-r1:8b",
++    "llama3.3:70b",
++]
++
++KOKORO_VOICES = [
++    "af_heart", "af_alloy", "af_aoede", "af_bella", "af_jessica", "af_kore",
++    "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
++    "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam", "am_michael",
++    "am_onyx", "am_puck", "am_santa",
++    "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
++    "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
++]
++
++
++def _normalise(name: str) -> str:
++    name = name.strip().strip(".,!?\"'").lower()
++    # Spoken input arrives as "qwen3 8b" - map to the "qwen3:8b" tag form.
++    if ":" not in name and " " in name:
++        name = name.rsplit(" ", 1)[0] + ":" + name.rsplit(" ", 1)[1]
++    return name
++
++
++@dataclass
++class Registry:
++    bus: LogBus
++    model: str = field(default_factory=lambda: settings.ollama_model)
++    voice: str = field(default_factory=lambda: settings.tts_voice)
++    speed: float = field(default_factory=lambda: settings.tts_speed)
++    models: list[str] = field(default_factory=lambda: sorted({*DEFAULT_MODELS, settings.ollama_model}))
++    voices: list[str] = field(default_factory=lambda: list(KOKORO_VOICES))
++    model_verified: bool = False
++    _engine: object | None = None
++    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
++
++    # ---- discovery -----------------------------------------------------------
++
++    async def refresh_models(self) -> None:
++        """Merge live Ollama tags into the catalogue (best effort)."""
++        try:
++            def fetch() -> dict:
++                req = urllib.request.Request(f"{settings.ollama_base_url.rstrip('/')}/api/tags")
++                with urllib.request.urlopen(req, timeout=3) as resp:
++                    import json
++                    return json.loads(resp.read().decode())
++
++            info = await asyncio.to_thread(fetch)
++            tags = sorted(str(m.get("name", "")).strip() for m in info.get("models", []) if m.get("name"))
++            if tags:
++                merged = sorted({*self.models, *tags})
++                changed = merged != self.models
++                self.models = merged
++                if self.model in tags:
++                    self.model_verified = True
++                elif changed:
++                    self.bus.publish("info", "settings", f"model catalogue refreshed - {len(tags)} live tag(s) from ollama")
++        except Exception:  # noqa: BLE001 - offline is a normal state
++            pass
++
++    # ---- application -----------------------------------------------------------
++
++    def attach_engine(self, engine: object) -> None:
++        self._engine = engine
++
++    def _mirror_engine(self) -> None:
++        engine = self._engine
++        if engine is None:
++            return
++        if hasattr(engine, "voice"):
++            engine.voice = self.voice  # type: ignore[attr-defined]
++        if hasattr(engine, "speed"):
++            engine.speed = self.speed  # type: ignore[attr-defined]
++
++    def _resolve_model(self, value: str) -> tuple[str | None, bool]:
++        value = _normalise(value)
++        if not value:
++            return None, False
++        if value in self.models:
++            return value, True
++        for candidate in self.models:
++            if candidate.split(":")[0] == value or candidate.startswith(value):
++                return candidate, True
++        # Unknown tag: allow it (user may have pulled it after our last probe).
++        return (value, False) if re.match(r"^[\w.\-]+(:[\w.\-]+)?$", value) else (None, False)
++
++    def _resolve_voice(self, value: str) -> str | None:
++        value = value.strip().strip(".,!?\"'").lower().replace(" ", "_")
++        if value in self.voices:
++            return value
++        for candidate in self.voices:
++            if candidate.split("_")[-1] == value or candidate.endswith(value):
++                return candidate
++        return None
++
++    def apply(
++        self,
++        model: str | None = None,
++        voice: str | None = None,
++        speed: float | None = None,
++        announce: bool = True,
++    ) -> dict:
++        """Validate + apply a settings delta; logs and broadcasts every change."""
++        applied: dict[str, object] = {}
++        errors: list[str] = []
++
++        if model:
++            resolved, verified = self._resolve_model(model)
++            if resolved:
++                if resolved != self.model:
++                    self.model = resolved
++                    self.model_verified = verified
++                    applied["model"] = resolved
++                else:
++                    verified = self.model_verified
++            else:
++                errors.append(f"unknown model '{model.strip()}'")
++
++        if voice:
++            resolved = self._resolve_voice(voice)
++            if resolved:
++                if resolved != self.voice:
++                    self.voice = resolved
++                    applied["voice"] = resolved
++            else:
++                errors.append(f"unknown voice '{voice.strip()}'")
++
++        if speed is not None:
++            try:
++                speed_f = max(0.5, min(2.0, round(float(speed), 2)))
++                if abs(speed_f - self.speed) > 0.001:
++                    self.speed = speed_f
++                    applied["speed"] = speed_f
++            except (TypeError, ValueError):
++                errors.append(f"invalid speed '{speed}'")
++
++        if applied:
++            self._mirror_engine()
++            if announce:
++                parts = [f"{k} -> {v}" for k, v in applied.items()]
++                self.bus.publish("success", "settings", "applied " + ", ".join(parts))
++            self.broadcast()
++        for err in errors:
++            self.bus.publish("error", "settings", err)
++        return {"ok": not errors, "applied": applied, "errors": errors,
++                "settings": self.as_dict()}
++
++    def broadcast(self) -> None:
++        """Push the current settings to every telemetry client."""
++        self.bus.push_frame({"type": "settings.update", "settings": self.as_dict()})
++
++    def as_dict(self) -> dict:
++        return {
++            "model": self.model,
++            "model_verified": self.model_verified,
++            "models": self.models,
++            "voice": self.voice,
++            "voices": self.voices,
++            "speed": self.speed,
++        }
+diff --git a/backend/app/tts/fallback_engine.py b/backend/app/tts/fallback_engine.py
+index 6494161..32248f8 100644
+--- a/backend/app/tts/fallback_engine.py
++++ b/backend/app/tts/fallback_engine.py
+@@ -7,6 +7,9 @@ pipeline (WebSocket streaming -> Web Audio API -> particle sphere) is exercised
+ end to end. On a properly provisioned host the Kokoro engine takes over
+ automatically.
+ 
++Voice and speed are mutable: the settings registry hot-swaps them, changing
++pitch and cadence on the very next utterance.
++
+ Phonetics: words are split into pseudo-syllables; each syllable is a sum of
+ three formant sines on a decaying glottal pitch contour, with noise bursts for
+ fricatives and pauses at punctuation. Deterministic per text (hash seeded).
+@@ -31,9 +34,8 @@ class FallbackEngine:
+     sample_rate = settings.sample_rate
+ 
+     def __init__(self, voice: str | None = None) -> None:
+-        self.voice = voice or settings.tts_voice
+-        # Male voices (am_/bm_) get a lower fundamental than female (af_/bf_).
+-        self._f0 = 128.0 if self.voice.startswith(("am_", "bm_")) else 196.0
++        self.voice = voice or settings.tts_voice      # mutable, registry-controlled
++        self.speed = settings.tts_speed               # mutable, registry-controlled
+ 
+     # -- public API ---------------------------------------------------------
+ 
+@@ -55,8 +57,11 @@ class FallbackEngine:
+ 
+     def _render(self, words: list[str]) -> np.ndarray:
+         sr = self.sample_rate
++        speed = max(0.5, min(2.0, float(self.speed)))
+         parts: list[np.ndarray] = []
+         total_words = max(1, len(words))
++        # Male voices (am_/bm_) get a lower fundamental than female (af_/bf_).
++        f0_base = 128.0 if self.voice.startswith(("am_", "bm_")) else 196.0
+ 
+         for wi, word in enumerate(words):
+             seed = int(hashlib.blake2b(word.encode("utf-8"), digest_size=4).hexdigest(), 16)
+@@ -64,10 +69,10 @@ class FallbackEngine:
+             syllables = self._syllable_count(word)
+             # Gentle declination across the utterance, like natural speech.
+             progress = wi / total_words
+-            f0 = self._f0 * (1.06 - 0.12 * progress)
++            f0 = f0_base * (1.06 - 0.12 * progress)
+ 
+             for si in range(syllables):
+-                dur = float(rng.uniform(0.085, 0.165))
++                dur = float(rng.uniform(0.085, 0.165)) / speed
+                 n = int(sr * dur)
+                 t = np.arange(n) / sr
+                 syl_prog = si / max(1, syllables)
+@@ -90,7 +95,7 @@ class FallbackEngine:
+             # Fricative burst for s/sh/f/x words.
+             letters = [c for c in word.lower() if c.isalpha()]
+             if letters and letters[-1] in _FRICATIVES:
+-                n = int(sr * 0.07)
++                n = int(sr * 0.07 / speed)
+                 noise = np.random.default_rng(seed + 7).standard_normal(n)
+                 kernel = np.array([1.0, 2.0, 1.0]) / 4.0
+                 noise = np.convolve(noise, kernel, mode="same")
+@@ -98,11 +103,11 @@ class FallbackEngine:
+                 parts.append(noise * env * 0.10)
+ 
+             # Inter-word pause; longer at punctuation.
+-            pause = 0.035
++            pause = 0.035 / speed
+             if word.endswith((",", ";", ":")):
+-                pause = 0.14
++                pause = 0.14 / speed
+             elif word.endswith((".", "!", "?", ";")):
+-                pause = 0.22
++                pause = 0.22 / speed
+             parts.append(np.zeros(int(sr * pause), dtype=np.float32))
+ 
+         audio = np.concatenate(parts) if parts else np.zeros(sr, dtype=np.float32)
+diff --git a/backend/app/tts/kokoro_engine.py b/backend/app/tts/kokoro_engine.py
+index 91e7147..138e342 100644
+--- a/backend/app/tts/kokoro_engine.py
++++ b/backend/app/tts/kokoro_engine.py
+@@ -46,7 +46,8 @@ class KokoroEngine:
+ 
+     def __init__(self, pipeline, voice: str, library: str) -> None:
+         self._pipeline = pipeline
+-        self.voice = voice
++        self.voice = voice  # mutable - the registry can hot-swap this
++        self.speed = settings.tts_speed  # mutable - registry-controlled
+         self.library = library  # "pykokoro" | "kokoro"
+ 
+     @property
+@@ -93,7 +94,7 @@ class KokoroEngine:
+ 
+     def stream(self, text: str) -> Iterator[SpeechChunk]:
+         text = self._clean(text)
+-        generator = self._pipeline(text, voice=self.voice, speed=settings.tts_speed)
++        generator = self._pipeline(text, voice=self.voice, speed=self.speed)
+         for result in generator:
+             audio = _to_numpy(getattr(result, "audio", None))
+             if audio.size == 0:
+diff --git a/backend/app/tts/manager.py b/backend/app/tts/manager.py
+index 24991b1..a839170 100644
+--- a/backend/app/tts/manager.py
++++ b/backend/app/tts/manager.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import base64
++import threading
+ import time
+ import uuid
+ from dataclasses import dataclass
+@@ -84,6 +85,7 @@ class TTSManager:
+         frames = 0
+         samples = 0
+         producer: asyncio.Future | None = None
++        stop = threading.Event()
+         self._broadcast({
+             "type": "tts.start",
+             "utterance_id": utterance_id,
+@@ -95,18 +97,30 @@ class TTSManager:
+         self.bus.publish("voice", "tts", f"synthesising {len(text)} chars with {self.engine.name}")
+         try:
+             queue: asyncio.Queue[SpeechChunk | None] = asyncio.Queue(maxsize=32)
+-
+             loop = asyncio.get_running_loop()
+ 
++            def safe_put(item: SpeechChunk | None) -> None:
++                """Thread-safe enqueue that never raises into the loop."""
++                try:
++                    queue.put_nowait(item)
++                except asyncio.QueueFull:
++                    try:
++                        queue.get_nowait()
++                        queue.put_nowait(item)
++                    except Exception:  # pragma: no cover - defensive
++                        pass
++
+             def produce() -> None:
+                 try:
+                     for chunk in self.engine.stream(text):
+-                        loop.call_soon_threadsafe(lambda c=chunk: queue.put_nowait(c))
++                        if stop.is_set():
++                            return
++                        loop.call_soon_threadsafe(safe_put, chunk)
+                 except Exception as exc:  # noqa: BLE001
+                     err = exc
+-                    loop.call_soon_threadsafe(lambda: queue.put_nowait(_Errored(err)))
++                    loop.call_soon_threadsafe(safe_put, _Errored(err))
+                     return
+-                loop.call_soon_threadsafe(lambda: queue.put_nowait(None))
++                loop.call_soon_threadsafe(safe_put, None)
+ 
+             producer = loop.run_in_executor(None, produce)
+             while True:
+@@ -147,6 +161,7 @@ class TTSManager:
+             self._broadcast({"type": "tts.error", "utterance_id": utterance_id, "detail": str(exc)})
+             self.bus.publish("error", "tts", f"synthesis failed: {type(exc).__name__}: {exc}")
+         finally:
++            stop.set()  # halt the producer thread promptly on cancel/exit
+             if producer is not None:
+                 await asyncio.gather(producer, return_exceptions=True)
+             elapsed = time.monotonic() - started
+diff --git a/backend/scripts/smoke.py b/backend/scripts/smoke.py
+index c75f005..9ef7d92 100644
+--- a/backend/scripts/smoke.py
++++ b/backend/scripts/smoke.py
+@@ -30,6 +30,31 @@ async def check_health(base: str) -> dict:
+     return data
+ 
+ 
++async def check_settings(base: str) -> None:
++    """Settings registry: read, live voice/speed switch, restore."""
++    with urllib.request.urlopen(f"{base}/api/settings", timeout=5) as resp:
++        data = json.loads(resp.read().decode())
++    original = data["settings"]
++    assert original["models"] and original["voices"], "catalogues empty"
++    print(f"PASS settings read - model={original['model']} voices={len(original['voices'])}")
++
++    new_voice = next(v for v in original["voices"] if v != original["voice"])
++    payload = json.dumps({"voice": new_voice, "speed": 1.15}).encode()
++    req = urllib.request.Request(f"{base}/api/settings", data=payload,
++                                 headers={"Content-Type": "application/json"}, method="POST")
++    with urllib.request.urlopen(req, timeout=5) as resp:
++        result = json.loads(resp.read().decode())
++    assert result["ok"] and "voice" in result["applied"] and "speed" in result["applied"], result
++    print(f"PASS settings write - {result['applied']}")
++
++    restore = json.dumps({"voice": original["voice"], "speed": original["speed"]}).encode()
++    req = urllib.request.Request(f"{base}/api/settings", data=restore,
++                                 headers={"Content-Type": "application/json"}, method="POST")
++    with urllib.request.urlopen(req, timeout=5) as resp:
++        json.loads(resp.read().decode())
++    print("PASS settings restore")
++
++
+ async def check_logs(base: str) -> None:
+     async with websockets.connect(base.replace("http", "ws") + "/ws/logs") as ws:
+         hello = json.loads(await asyncio.wait_for(ws.recv(), 5))
+@@ -49,19 +74,26 @@ async def check_logs(base: str) -> None:
+ 
+ async def check_audio(base: str, out_wav: str) -> None:
+     async with websockets.connect(base.replace("http", "ws") + "/ws/audio") as ws:
++        # A previous utterance may still be streaming (e.g. a crew answer);
++        # our speak interrupts it. Track OUR utterance id and ignore others.
+         await ws.send(json.dumps({"type": "speak", "text": "All systems nominal. Standing by."}))
++        mine: str | None = None
+         frames: list[bytes] = []
+         sample_rate = 24000
+         deadline = time.time() + 30
+         finished = False
+         while time.time() < deadline:
+             frame = json.loads(await asyncio.wait_for(ws.recv(), 10))
+-            if frame["type"] == "tts.start":
++            ftype = frame["type"]
++            if ftype == "tts.start" and mine is None:
++                mine = frame["utterance_id"]
+                 sample_rate = frame["sample_rate"]
+                 print(f"PASS audio start - engine={frame['engine']} rate={sample_rate}")
+-            elif frame["type"] == "tts.chunk":
++            elif ftype == "tts.chunk" and frame["utterance_id"] == (mine or ""):
+                 frames.append(base64.b64decode(frame["data"]))
+-            elif frame["type"] == "tts.end":
++            elif ftype == "tts.end" and frame["utterance_id"] == mine:
++                if frame.get("cancelled"):
++                    raise AssertionError("our utterance was cancelled by another request")
+                 finished = True
+                 break
+         assert finished and frames, f"audio stream incomplete ({len(frames)} frames)"
+@@ -82,6 +114,7 @@ async def main() -> None:
+     args = parser.parse_args()
+ 
+     await check_health(args.url)
++    await check_settings(args.url)
+     await check_logs(args.url)
+     await check_audio(args.url, args.wav)
+     print("ALL CHECKS PASSED")
+diff --git a/frontend/src/app/globals.css b/frontend/src/app/globals.css
+index a8db7bb..09f07f4 100644
+--- a/frontend/src/app/globals.css
++++ b/frontend/src/app/globals.css
+@@ -183,6 +183,30 @@ body {
+   border-bottom: 1px solid var(--line);
+ }
+ 
++.telemetry-header-actions {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++}
++
++.gear {
++  background: transparent;
++  border: 1px solid var(--line);
++  border-radius: 2px;
++  color: var(--dim);
++  font-size: 11px;
++  line-height: 1;
++  padding: 4px 6px;
++  cursor: pointer;
++  transition: color 150ms ease, border-color 150ms ease, transform 300ms ease;
++}
++
++.gear:hover {
++  color: var(--blue);
++  border-color: rgba(94, 176, 255, 0.4);
++  transform: rotate(45deg);
++}
++
+ .telemetry-title {
+   font-family: var(--mono);
+   font-size: 10px;
+@@ -343,6 +367,208 @@ body {
+   padding: 0 1px;
+ }
+ 
++/* ---------- settings panel ---------- */
++
++.settings-scrim {
++  position: absolute;
++  inset: 0;
++  z-index: 18;
++  background: rgba(2, 4, 8, 0.45);
++  backdrop-filter: blur(2px);
++}
++
++.settings-panel {
++  position: absolute;
++  top: 50%;
++  left: 50%;
++  transform: translate(-50%, -50%);
++  z-index: 20;
++  width: min(420px, calc(100vw - 40px));
++  background: rgba(8, 11, 16, 0.78);
++  border: 1px solid rgba(94, 176, 255, 0.18);
++  border-radius: 2px;
++  backdrop-filter: blur(18px);
++  -webkit-backdrop-filter: blur(18px);
++  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6), 0 0 40px rgba(60, 110, 220, 0.08);
++  animation: settings-in 220ms ease;
++}
++
++@keyframes settings-in {
++  from {
++    opacity: 0;
++    transform: translate(-50%, -47%);
++  }
++  to {
++    opacity: 1;
++    transform: translate(-50%, -50%);
++  }
++}
++
++.settings-close {
++  background: transparent;
++  border: none;
++  color: var(--muted);
++  font-size: 11px;
++  cursor: pointer;
++  padding: 2px 4px;
++}
++
++.settings-close:hover {
++  color: var(--ink);
++}
++
++.settings-body {
++  display: flex;
++  flex-direction: column;
++  gap: 18px;
++  padding: 16px 16px 12px;
++}
++
++.settings-field {
++  display: flex;
++  flex-direction: column;
++  gap: 7px;
++}
++
++.settings-label {
++  display: flex;
++  justify-content: space-between;
++  align-items: baseline;
++  font-family: var(--mono);
++  font-size: 10px;
++  letter-spacing: 0.16em;
++  color: var(--dim);
++}
++
++.settings-note {
++  font-style: normal;
++  font-size: 9px;
++  letter-spacing: 0.05em;
++  color: var(--muted);
++}
++
++.settings-value {
++  color: var(--blue);
++  font-weight: 600;
++}
++
++.settings-panel select {
++  appearance: none;
++  width: 100%;
++  background: rgba(14, 18, 26, 0.9);
++  border: 1px solid var(--line);
++  border-radius: 2px;
++  color: var(--ink);
++  font-family: var(--mono);
++  font-size: 12px;
++  padding: 8px 10px;
++  outline: none;
++  cursor: pointer;
++  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%),
++    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
++  background-position: calc(100% - 16px) 55%, calc(100% - 11px) 55%;
++  background-size: 5px 5px;
++  background-repeat: no-repeat;
++}
++
++.settings-panel select:focus {
++  border-color: rgba(94, 176, 255, 0.45);
++}
++
++.settings-panel input[type="range"] {
++  width: 100%;
++  height: 2px;
++  appearance: none;
++  -webkit-appearance: none;
++  background: linear-gradient(90deg, rgba(94, 176, 255, 0.6), rgba(94, 176, 255, 0.15));
++  outline: none;
++  cursor: pointer;
++}
++
++.settings-panel input[type="range"]::-webkit-slider-thumb {
++  appearance: none;
++  -webkit-appearance: none;
++  width: 12px;
++  height: 12px;
++  border-radius: 50%;
++  background: var(--blue);
++  box-shadow: 0 0 10px rgba(94, 176, 255, 0.7);
++  cursor: pointer;
++}
++
++.settings-panel input[type="range"]::-moz-range-thumb {
++  width: 12px;
++  height: 12px;
++  border: none;
++  border-radius: 50%;
++  background: var(--blue);
++  box-shadow: 0 0 10px rgba(94, 176, 255, 0.7);
++  cursor: pointer;
++}
++
++.settings-scale {
++  display: flex;
++  justify-content: space-between;
++  font-family: var(--mono);
++  font-size: 9px;
++  color: var(--muted);
++}
++
++.settings-status {
++  display: flex;
++  gap: 14px;
++  font-family: var(--mono);
++  font-size: 10px;
++  color: var(--muted);
++}
++
++.settings-hint {
++  margin: 0;
++  font-size: 11px;
++  line-height: 1.6;
++  color: var(--dim);
++  border-top: 1px solid var(--line);
++  padding-top: 12px;
++}
++
++.settings-hint i {
++  color: var(--blue);
++  font-style: normal;
++}
++
++.settings-footer {
++  display: flex;
++  justify-content: space-between;
++  align-items: center;
++  gap: 10px;
++  padding: 9px 16px;
++  border-top: 1px solid var(--line);
++  min-height: 34px;
++}
++
++.settings-save {
++  font-family: var(--mono);
++  font-size: 9px;
++  letter-spacing: 0.2em;
++}
++
++.settings-save.good {
++  color: var(--green);
++}
++
++.settings-save.bad {
++  color: var(--red);
++}
++
++.settings-detail {
++  font-family: var(--mono);
++  font-size: 9px;
++  color: var(--muted);
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
+ /* ---------- boot veil ---------- */
+ 
+ .boot-veil {
+diff --git a/frontend/src/audio/engine.ts b/frontend/src/audio/engine.ts
+index 6096926..1c6be05 100644
+--- a/frontend/src/audio/engine.ts
++++ b/frontend/src/audio/engine.ts
+@@ -3,17 +3,19 @@
+  *
+  * Receives streamed int16 PCM chunks from /ws/audio, schedules them gaplessly
+  * on a single AudioContext, and exposes an AnalyserNode whose frequency data
+- * drives the particle sphere via `audioLevels`.
++ * drives the particle sphere via `audioLevels` (bands, bass/mid/treble, kick).
+  *
+  * Handles the browser autoplay policy: if the context starts suspended (no
+  * user gesture yet) buffers are still scheduled against the frozen clock and
+  * will play the moment `resume()` succeeds (first click / keypress).
+  */
+ 
+-import { audioLevels } from "./levels";
++import { audioLevels, BAND_COUNT } from "./levels";
+ 
+-const SMOOTH_UP = 0.35;
++const SMOOTH_UP = 0.4;
+ const SMOOTH_DOWN = 0.08;
++/** Input gain on raw analyser energy - the hologram should feel ALIVE. */
++const SENSITIVITY = 1.55;
+ 
+ export class AudioEngine {
+   private ctx: AudioContext | null = null;
+@@ -22,6 +24,8 @@ export class AudioEngine {
+   private freq: Uint8Array<ArrayBuffer> = new Uint8Array(128);
+   private nextTime = 0;
+   private unlocked = false;
++  /** Log-spaced bin ranges for the 24 visualizer bands (computed once). */
++  private bandRanges: Array<[number, number]> = [];
+ 
+   /** Lazily build the graph - safe to call repeatedly. */
+   ensure(): AudioContext | null {
+@@ -42,6 +46,14 @@ export class AudioEngine {
+     this.analyser = analyser;
+     this.freq = new Uint8Array(new ArrayBuffer(analyser.frequencyBinCount));
+     this.nextTime = ctx.currentTime;
++    // Log-spaced bands across the meaningful spectrum (skip bin 0 = DC).
++    const bins = analyser.frequencyBinCount;
++    this.bandRanges = [];
++    for (let b = 0; b < BAND_COUNT; b++) {
++      const lo = Math.max(1, Math.floor(Math.pow(bins - 1, b / BAND_COUNT)));
++      const hi = Math.max(lo + 1, Math.floor(Math.pow(bins - 1, (b + 1) / BAND_COUNT)));
++      this.bandRanges.push([lo, Math.min(hi, bins)]);
++    }
+     return ctx;
+   }
+ 
+@@ -53,6 +65,11 @@ export class AudioEngine {
+     this.unlocked = true;
+   }
+ 
++  /** Transient impulse - call when an utterance starts. */
++  kick(): void {
++    audioLevels.kick = 1;
++  }
++
+   /** Feed one PCM chunk (int16 little-endian mono) into the schedule. */
+   push(int16: Int16Array, sampleRate: number): void {
+     const ctx = this.ensure();
+@@ -83,6 +100,9 @@ export class AudioEngine {
+ 
+   /** Called every animation frame from the 3D loop. */
+   tick(dt: number, elapsed: number): void {
++    // Kick decays fast but visibly.
++    audioLevels.kick *= Math.exp(-dt * 3.2);
++
+     const analyser = this.analyser;
+     const speaking = !!this.ctx && this.nextTime > this.ctx.currentTime + 0.01;
+ 
+@@ -93,7 +113,7 @@ export class AudioEngine {
+ 
+     if (analyser && speaking) {
+       analyser.getByteFrequencyData(this.freq);
+-      const n = this.freq.length; // 256 bins over 0..~12kHz
++      const n = this.freq.length;
+       const bEnd = Math.floor(n * 0.08);
+       const mEnd = Math.floor(n * 0.4);
+       let b = 0;
+@@ -105,16 +125,36 @@ export class AudioEngine {
+         else if (i < mEnd) m += v;
+         else t += v;
+       }
+-      bass = b / Math.max(1, bEnd);
+-      mid = m / Math.max(1, mEnd - bEnd);
+-      treble = t / Math.max(1, n - mEnd);
++      bass = Math.min(1, (b / Math.max(1, bEnd)) * SENSITIVITY * 1.15);
++      mid = Math.min(1, (m / Math.max(1, mEnd - bEnd)) * SENSITIVITY);
++      treble = Math.min(1, (t / Math.max(1, n - mEnd)) * SENSITIVITY * 1.3);
+       level = Math.min(1, bass * 0.55 + mid * 0.35 + treble * 0.25);
+-    } else if (!speaking) {
++
++      // Refresh the visualizer bands.
++      const bands = audioLevels.bands;
++      for (let band = 0; band < BAND_COUNT; band++) {
++        const [lo, hi] = this.bandRanges[band] ?? [1, 2];
++        let sum = 0;
++        for (let i = lo; i < hi; i++) sum += this.freq[i] / 255;
++        // Higher bands carry less energy - tilt them up.
++        const tilt = 1 + (band / BAND_COUNT) * 0.9;
++        const value = Math.min(1, (sum / (hi - lo)) * tilt * SENSITIVITY);
++        bands[band] += (value - bands[band]) * Math.min(1, dt * 14);
++      }
++    } else {
+       // Idle: gentle breathing so the core feels alive between utterances.
+       level = 0.05 + 0.035 * (0.5 + 0.5 * Math.sin(elapsed * 1.4));
+       bass = 0.25 + 0.15 * (0.5 + 0.5 * Math.sin(elapsed * 0.9));
+       treble = 0.12;
+       mid = level;
++      const bands = audioLevels.bands;
++      for (let band = 0; band < BAND_COUNT; band++) {
++        const idle =
++          0.06 +
++          0.05 * (0.5 + 0.5 * Math.sin(elapsed * 1.8 + band * 0.55)) +
++          0.03 * (0.5 + 0.5 * Math.sin(elapsed * 0.7 - band * 0.3));
++        bands[band] += (idle - bands[band]) * Math.min(1, dt * 6);
++      }
+     }
+ 
+     const kUp = 1 - Math.pow(1 - SMOOTH_UP, dt * 60);
+diff --git a/frontend/src/audio/levels.ts b/frontend/src/audio/levels.ts
+index b7ebab5..a7fc574 100644
+--- a/frontend/src/audio/levels.ts
++++ b/frontend/src/audio/levels.ts
+@@ -16,14 +16,22 @@ export interface AudioLevels {
+   mid: number;
+   /** high-frequency energy 0..1 - drives glow / point brightness */
+   treble: number;
++  /** 24 log-spaced spectrum bands 0..1 - drives the ring visualizer */
++  bands: Float32Array;
++  /** transient kick 0..1, spikes at utterance start, decays exponentially */
++  kick: number;
+   /** true while scheduled audio is still playing */
+   speaking: boolean;
+ }
+ 
++export const BAND_COUNT = 24;
++
+ export const audioLevels: AudioLevels = {
+   level: 0,
+   bass: 0,
+   mid: 0,
+   treble: 0,
++  bands: new Float32Array(BAND_COUNT),
++  kick: 0,
+   speaking: false,
+ };
+diff --git a/frontend/src/components/JarvisApp.tsx b/frontend/src/components/JarvisApp.tsx
+index bb73495..d4ae6ab 100644
+--- a/frontend/src/components/JarvisApp.tsx
++++ b/frontend/src/components/JarvisApp.tsx
+@@ -5,6 +5,7 @@
+ import dynamic from "next/dynamic";
+ import Hud from "./Hud";
+ import MathAnchor from "./MathAnchor";
++import SettingsPanel from "./SettingsPanel";
+ import TelemetryPanel from "./TelemetryPanel";
+ import { useJarvisConnection } from "@/hooks/useJarvisConnection";
+ import { useJarvis } from "@/state/jarvis";
+@@ -23,6 +24,7 @@ export default function JarvisApp() {
+       </div>
+       <Hud />
+       <TelemetryPanel />
++      <SettingsPanel />
+       <MathAnchor />
+       <div className={`boot-veil ${logsConnected ? "gone" : ""}`}>
+         <span>ESTABLISHING UPLINK</span>
+diff --git a/frontend/src/components/Scene.tsx b/frontend/src/components/Scene.tsx
+index 304e184..0f7a4ea 100644
+--- a/frontend/src/components/Scene.tsx
++++ b/frontend/src/components/Scene.tsx
+@@ -1,11 +1,21 @@
+ "use client";
+ 
+ /**
+- * The holographic core (PRD §2):
++ * The holographic core (PRD §2), tuned for maximum audio responsiveness:
++ *
+  *   - outer cage: dim gray 1px wireframe icosahedron, slow Y rotation
+- *   - particle sphere: white glowing points on a dense fibonacci sphere,
+- *     pulsing/scaling/spinning with Web Audio frequency data
+- *   - soft core glow sprite whose intensity tracks overall loudness
++ *   - particle sphere: 4200 white glowing points on a fibonacci sphere with
++ *     per-point phase attributes; every frame the CPU displaces points along
++ *     their radial axes with travelling waves driven by level / bass / kick
++ *   - FFT ring visualizer: 24 log-spaced spectrum bands mapped onto a
++ *     mirrored 48-point ring orbiting the core
++ *   - gyroscope rings: two tilted thin circles whose spin rate and opacity
++ *     accelerate with bass energy
++ *   - satellites: three bright dots orbiting the core, speed with bass
++ *   - layered glow sprites: core + halo, intensity follows loudness
++ *
++ * All animation state lives in the mutable `audioLevels` singleton - no React
++ * state is touched from the render loop.
+  */
+ 
+ import { useMemo, useRef } from "react";
+@@ -13,7 +23,9 @@ import { Canvas, useFrame } from "@react-three/fiber";
+ import { AdaptiveDpr } from "@react-three/drei";
+ import * as THREE from "three";
+ import { audioEngine } from "@/audio/engine";
+-import { audioLevels } from "@/audio/levels";
++import { audioLevels, BAND_COUNT } from "@/audio/levels";
++
++const TAU = Math.PI * 2;
+ 
+ /* ---------- helpers ---------- */
+ 
+@@ -32,38 +44,71 @@ function fibonacciSphere(count: number, radius: number, jitter = 0.04): Float32A
+   return positions;
+ }
+ 
+-function softDotTexture(): THREE.Texture {
+-  const size = 64;
+-  const canvas = document.createElement("canvas");
+-  canvas.width = size;
+-  canvas.height = size;
+-  const ctx = canvas.getContext("2d")!;
+-  const gradient = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+-  gradient.addColorStop(0, "rgba(255,255,255,1)");
+-  gradient.addColorStop(0.35, "rgba(255,255,255,0.55)");
+-  gradient.addColorStop(1, "rgba(255,255,255,0)");
+-  ctx.fillStyle = gradient;
+-  ctx.fillRect(0, 0, size, size);
+-  const texture = new THREE.CanvasTexture(canvas);
+-  texture.needsUpdate = true;
+-  return texture;
++function circlePoints(segments: number, radius: number): Float32Array {
++  const positions = new Float32Array(segments * 3);
++  for (let i = 0; i < segments; i++) {
++    const theta = (i / segments) * TAU;
++    positions[i * 3] = Math.cos(theta) * radius;
++    positions[i * 3 + 1] = 0;
++    positions[i * 3 + 2] = Math.sin(theta) * radius;
++  }
++  return positions;
++}
++
++/** Circle as segment PAIRS (v0-v1, v1-v2, ...) for <lineSegments>. */
++function circleSegments(segments: number, radius: number): Float32Array {
++  const positions = new Float32Array(segments * 2 * 3);
++  for (let i = 0; i < segments; i++) {
++    const a = (i / segments) * TAU;
++    const b = ((i + 1) / segments) * TAU;
++    positions[i * 6] = Math.cos(a) * radius;
++    positions[i * 6 + 1] = 0;
++    positions[i * 6 + 2] = Math.sin(a) * radius;
++    positions[i * 6 + 3] = Math.cos(b) * radius;
++    positions[i * 6 + 4] = 0;
++    positions[i * 6 + 5] = Math.sin(b) * radius;
++  }
++  return positions;
+ }
+ 
+-function glowTexture(): THREE.Texture {
++function radialTexture(stops: Array<[number, string]>): THREE.Texture {
+   const size = 256;
+   const canvas = document.createElement("canvas");
+   canvas.width = size;
+   canvas.height = size;
+   const ctx = canvas.getContext("2d")!;
+   const gradient = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+-  gradient.addColorStop(0, "rgba(150,190,255,0.55)");
+-  gradient.addColorStop(0.35, "rgba(90,130,220,0.22)");
+-  gradient.addColorStop(1, "rgba(40,70,140,0)");
++  for (const [offset, color] of stops) gradient.addColorStop(offset, color);
+   ctx.fillStyle = gradient;
+   ctx.fillRect(0, 0, size, size);
+   return new THREE.CanvasTexture(canvas);
+ }
+ 
++function dotTexture(): THREE.Texture {
++  return radialTexture([
++    [0, "rgba(255,255,255,1)"],
++    [0.3, "rgba(255,255,255,0.6)"],
++    [1, "rgba(255,255,255,0)"],
++  ]);
++}
++
++function coreGlowTexture(): THREE.Texture {
++  return radialTexture([
++    [0, "rgba(190,220,255,0.85)"],
++    [0.22, "rgba(130,175,255,0.4)"],
++    [0.55, "rgba(70,115,220,0.16)"],
++    [1, "rgba(30,60,140,0)"],
++  ]);
++}
++
++function haloGlowTexture(): THREE.Texture {
++  return radialTexture([
++    [0, "rgba(90,140,255,0.30)"],
++    [0.5, "rgba(50,90,200,0.12)"],
++    [1, "rgba(20,45,120,0)"],
++  ]);
++}
++
+ /* ---------- outer cage ---------- */
+ 
+ function Cage() {
+@@ -73,28 +118,46 @@ function Cage() {
+   });
+   return (
+     <mesh ref={mesh}>
+-      <icosahedronGeometry args={[2.35, 1]} />
+-      <meshBasicMaterial color="#4a515c" wireframe transparent opacity={0.42} />
++      <icosahedronGeometry args={[2.42, 1]} />
++      <meshBasicMaterial color="#4a515c" wireframe transparent opacity={0.4} />
+     </mesh>
+   );
+ }
+ 
+-/* ---------- particle sphere ---------- */
++/* ---------- particle sphere (displacement waves) ---------- */
++
++const CORE_COUNT = 4200;
++const CORE_RADIUS = 1.42;
+ 
+ function ParticleSphere() {
+   const group = useRef<THREE.Group>(null);
+   const material = useRef<THREE.PointsMaterial>(null);
+   const haloMaterial = useRef<THREE.PointsMaterial>(null);
+-  const dot = useMemo(softDotTexture, []);
++  const dot = useMemo(dotTexture, []);
+ 
+-  const coreGeometry = useMemo(() => {
++  const { coreGeometry, base, phases, radii } = useMemo(() => {
++    const positions = fibonacciSphere(CORE_COUNT, CORE_RADIUS, 0.05);
+     const geometry = new THREE.BufferGeometry();
+-    geometry.setAttribute("position", new THREE.BufferAttribute(fibonacciSphere(2600, 1.5), 3));
+-    return geometry;
++    geometry.setAttribute("position", new THREE.BufferAttribute(positions.slice(), 3));
++    const phaseA = new Float32Array(CORE_COUNT);
++    const phaseB = new Float32Array(CORE_COUNT);
++    const radii = new Float32Array(CORE_COUNT);
++    for (let i = 0; i < CORE_COUNT; i++) {
++      phaseA[i] = Math.random();
++      phaseB[i] = Math.random();
++      radii[i] = Math.hypot(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]);
++    }
++    return {
++      coreGeometry: geometry,
++      base: positions,
++      phases: { a: phaseA, b: phaseB },
++      radii,
++    };
+   }, []);
++
+   const haloGeometry = useMemo(() => {
+     const geometry = new THREE.BufferGeometry();
+-    geometry.setAttribute("position", new THREE.BufferAttribute(fibonacciSphere(500, 1.95, 0.02), 3));
++    geometry.setAttribute("position", new THREE.BufferAttribute(fibonacciSphere(600, 1.92, 0.02), 3));
+     return geometry;
+   }, []);
+ 
+@@ -102,25 +165,45 @@ function ParticleSphere() {
+ 
+   useFrame((state, dt) => {
+     audioEngine.tick(dt, state.clock.elapsedTime);
+-    const { level, bass, treble, speaking } = audioLevels;
++    const { level, bass, treble, kick, speaking } = audioLevels;
++    const t = state.clock.elapsedTime;
++
++    // --- CPU displacement: travelling waves through the particle field ---
++    const attr = coreGeometry.getAttribute("position") as THREE.BufferAttribute;
++    const pos = attr.array as Float32Array;
++    const waveAmp = 0.10 + level * 0.42 + kick * 0.18;
++    const shimmer = 0.02 + treble * 0.10;
++    for (let i = 0; i < CORE_COUNT; i++) {
++      const r = radii[i];
++      const wave =
++        Math.sin(phases.a[i] * TAU + t * 2.4 + r * 4.2) * waveAmp +
++        Math.sin(phases.b[i] * TAU - t * 3.3 + r * 2.0) * (0.35 * waveAmp) +
++        Math.sin(t * 9.0 + phases.a[i] * TAU * 3.0) * shimmer;
++      const factor = (r + wave) / r;
++      pos[i * 3] = base[i * 3] * factor;
++      pos[i * 3 + 1] = base[i * 3 + 1] * factor;
++      pos[i * 3 + 2] = base[i * 3 + 2] * factor;
++    }
++    attr.needsUpdate = true;
+ 
+-    // Scale pulse: breathing idle -> audio-driven swell.
+-    const targetScale = 1 + level * 0.42 + bass * 0.22 + (speaking ? 0.05 : 0);
+-    smooth.current.scale += (targetScale - smooth.current.scale) * Math.min(1, dt * 10);
++    // --- group transform: pulse scale + accelerating rotation ---
++    const targetScale = 1 + level * 0.34 + bass * 0.22 + kick * 0.3 + (speaking ? 0.04 : 0);
++    smooth.current.scale += (targetScale - smooth.current.scale) * Math.min(1, dt * 11);
+     if (group.current) {
+       const s = smooth.current.scale;
+       group.current.scale.set(s, s, s);
+-      // Rotation accelerates with low-frequency energy.
+-      group.current.rotation.y += dt * (0.09 + bass * 1.35 + level * 0.5);
+-      group.current.rotation.x += dt * 0.016;
++      group.current.rotation.y += dt * (0.1 + bass * 2.2 + level * 0.7 + kick * 0.8);
++      group.current.rotation.x += dt * 0.018;
+     }
+-    // Glow intensity + point size track treble/overall loudness.
++
++    // --- material energy ---
+     if (material.current) {
+-      material.current.size = 0.07 + level * 0.055 + treble * 0.02;
+-      material.current.opacity = 0.55 + level * 0.4;
++      material.current.size = 0.062 + level * 0.062 + treble * 0.03;
++      material.current.opacity = Math.min(1, 0.55 + level * 0.5 + treble * 0.2);
+     }
+     if (haloMaterial.current) {
+-      haloMaterial.current.opacity = 0.10 + treble * 0.5 * level;
++      haloMaterial.current.opacity = Math.min(0.9, 0.1 + treble * 0.45 + level * 0.25);
++      haloMaterial.current.size = 0.14 + bass * 0.08;
+     }
+   });
+ 
+@@ -131,10 +214,10 @@ function ParticleSphere() {
+           ref={material}
+           map={dot}
+           color="#ffffff"
+-          size={0.07}
++          size={0.062}
+           sizeAttenuation
+           transparent
+-          opacity={0.6}
++          opacity={0.62}
+           depthWrite={false}
+           blending={THREE.AdditiveBlending}
+         />
+@@ -144,7 +227,7 @@ function ParticleSphere() {
+           ref={haloMaterial}
+           map={dot}
+           color="#9fc2ff"
+-          size={0.16}
++          size={0.15}
+           sizeAttenuation
+           transparent
+           opacity={0.14}
+@@ -156,33 +239,201 @@ function ParticleSphere() {
+   );
+ }
+ 
+-/* ---------- core glow ---------- */
++/* ---------- FFT ring visualizer ---------- */
+ 
+-function CoreGlow() {
+-  const material = useRef<THREE.SpriteMaterial>(null);
+-  const sprite = useRef<THREE.Sprite>(null);
+-  const texture = useMemo(glowTexture, []);
+-  useFrame((_, dt) => {
+-    const target = 0.1 + audioLevels.level * 0.85;
+-    if (material.current) {
+-      material.current.opacity += (Math.min(0.75, target) - material.current.opacity) * Math.min(1, dt * 8);
++const RING_POINTS = BAND_COUNT * 2;
++const RING_RADIUS = 2.02;
++
++function SpectrumRing() {
++  const points = useRef<THREE.Points>(null);
++  const material = useRef<THREE.PointsMaterial>(null);
++  const dot = useMemo(dotTexture, []);
++
++  const geometry = useMemo(() => {
++    const geometry = new THREE.BufferGeometry();
++    geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(RING_POINTS * 3), 3));
++    return geometry;
++  }, []);
++
++  useFrame((state) => {
++    const attr = geometry.getAttribute("position") as THREE.BufferAttribute;
++    const pos = attr.array as Float32Array;
++    const t = state.clock.elapsedTime;
++    const ringPulse = 1 + audioLevels.level * 0.16 + audioLevels.kick * 0.2;
++    for (let i = 0; i < RING_POINTS; i++) {
++      // Mirror the 24 bands for a symmetric profile.
++      const band = i < BAND_COUNT ? i : RING_POINTS - 1 - i;
++      const value = audioLevels.bands[band] ?? 0;
++      const theta = (i / RING_POINTS) * TAU - Math.PI / 2;
++      const radius = (RING_RADIUS + value * 0.55) * ringPulse;
++      const lift = Math.sin(theta * 2 + t * 0.6) * 0.02;
++      pos[i * 3] = Math.cos(theta) * radius;
++      pos[i * 3 + 1] = lift;
++      pos[i * 3 + 2] = Math.sin(theta) * radius;
++    }
++    attr.needsUpdate = true;
++    if (points.current) {
++      points.current.rotation.y = t * 0.22;
+     }
+-    if (sprite.current) {
+-      const s = 6.2 + audioLevels.level * 2.4;
+-      sprite.current.scale.set(s, s, 1);
++    if (material.current) {
++      material.current.opacity = 0.35 + audioLevels.level * 0.55;
++      material.current.size = 0.045 + audioLevels.treble * 0.035;
+     }
+   });
++
+   return (
+-    <sprite ref={sprite}>
+-      <spriteMaterial
++    <points ref={points} geometry={geometry}>
++      <pointsMaterial
+         ref={material}
+-        map={texture}
++        map={dot}
++        color="#8fd0ff"
++        size={0.05}
++        sizeAttenuation
+         transparent
+-        opacity={0.15}
++        opacity={0.4}
+         depthWrite={false}
+         blending={THREE.AdditiveBlending}
+       />
+-    </sprite>
++    </points>
++  );
++}
++
++/* ---------- gyroscope rings ---------- */
++
++function GyroRings() {
++  const inner = useRef<THREE.LineSegments>(null);
++  const outer = useRef<THREE.LineSegments>(null);
++  const innerMat = useRef<THREE.LineBasicMaterial>(null);
++  const outerMat = useRef<THREE.LineBasicMaterial>(null);
++
++  const innerGeometry = useMemo(() => {
++    const geometry = new THREE.BufferGeometry();
++    geometry.setAttribute("position", new THREE.BufferAttribute(circleSegments(160, 2.16), 3));
++    return geometry;
++  }, []);
++  const outerGeometry = useMemo(() => {
++    const geometry = new THREE.BufferGeometry();
++    geometry.setAttribute("position", new THREE.BufferAttribute(circleSegments(160, 2.3), 3));
++    return geometry;
++  }, []);
++
++  useFrame((state, dt) => {
++    const t = state.clock.elapsedTime;
++    const spin = 1 + audioLevels.bass * 4.5 + audioLevels.level * 2.0;
++    if (inner.current) {
++      inner.current.rotation.y += dt * 0.55 * spin;
++      inner.current.rotation.z = Math.PI / 3 + Math.sin(t * 0.35) * 0.12;
++    }
++    if (outer.current) {
++      outer.current.rotation.y -= dt * 0.38 * spin;
++      outer.current.rotation.x = Math.PI / 2.6 + Math.sin(t * 0.27 + 1.7) * 0.15;
++    }
++    const glow = 0.08 + audioLevels.level * 0.4 + audioLevels.treble * 0.2;
++    if (innerMat.current) innerMat.current.opacity = Math.min(0.7, glow);
++    if (outerMat.current) outerMat.current.opacity = Math.min(0.55, glow * 0.7);
++  });
++
++  return (
++    <group>
++      <lineSegments ref={inner} geometry={innerGeometry}>
++        <lineBasicMaterial ref={innerMat} color="#7fb4ff" transparent opacity={0.12} blending={THREE.AdditiveBlending} />
++      </lineSegments>
++      <lineSegments ref={outer} geometry={outerGeometry}>
++        <lineBasicMaterial ref={outerMat} color="#5e8fd6" transparent opacity={0.08} blending={THREE.AdditiveBlending} />
++      </lineSegments>
++    </group>
++  );
++}
++
++/* ---------- orbiting satellites ---------- */
++
++const SATELLITES = [
++  { radius: 2.62, speed: 0.9, tilt: 0.22, phase: 0.0, size: 0.16 },
++  { radius: 2.78, speed: -0.62, tilt: -0.55, phase: 2.1, size: 0.12 },
++  { radius: 2.5, speed: 1.28, tilt: 1.05, phase: 4.2, size: 0.1 },
++];
++
++function Satellites() {
++  const group = useRef<THREE.Group>(null);
++  const dot = useMemo(dotTexture, []);
++  const refs = [useRef<THREE.Sprite>(null), useRef<THREE.Sprite>(null), useRef<THREE.Sprite>(null)];
++
++  useFrame((state) => {
++    const t = state.clock.elapsedTime;
++    const boost = 1 + audioLevels.bass * 2.6 + audioLevels.level * 1.4;
++    SATELLITES.forEach((orbit, i) => {
++      const sprite = refs[i].current;
++      if (!sprite) return;
++      const angle = orbit.phase + t * orbit.speed * boost;
++      sprite.position.set(
++        Math.cos(angle) * orbit.radius,
++        Math.sin(angle) * orbit.radius * Math.sin(orbit.tilt),
++        Math.sin(angle) * orbit.radius * Math.cos(orbit.tilt),
++      );
++      const pulse = orbit.size * (1 + audioLevels.treble * 0.8 + audioLevels.level * 0.5);
++      sprite.scale.set(pulse, pulse, 1);
++      (sprite.material as THREE.SpriteMaterial).opacity = 0.5 + audioLevels.level * 0.5;
++    });
++    if (group.current) group.current.rotation.y = t * 0.05;
++  });
++
++  return (
++    <group ref={group}>
++      {SATELLITES.map((_, i) => (
++        <sprite key={i} ref={refs[i]}>
++          <spriteMaterial
++            map={dot}
++            color={i === 0 ? "#cfe6ff" : "#9fc2ff"}
++            transparent
++            opacity={0.6}
++            depthWrite={false}
++            blending={THREE.AdditiveBlending}
++          />
++        </sprite>
++      ))}
++    </group>
++  );
++}
++
++/* ---------- layered glow ---------- */
++
++function CoreGlow() {
++  const coreMat = useRef<THREE.SpriteMaterial>(null);
++  const haloMat = useRef<THREE.SpriteMaterial>(null);
++  const core = useRef<THREE.Sprite>(null);
++  const halo = useRef<THREE.Sprite>(null);
++  const coreTexture = useMemo(coreGlowTexture, []);
++  const haloTexture = useMemo(haloGlowTexture, []);
++
++  useFrame((_, dt) => {
++    const { level, kick } = audioLevels;
++    if (coreMat.current) {
++      const target = Math.min(0.9, 0.16 + level * 0.9 + kick * 0.25);
++      coreMat.current.opacity += (target - coreMat.current.opacity) * Math.min(1, dt * 9);
++    }
++    if (haloMat.current) {
++      const target = Math.min(0.55, 0.06 + level * 0.5);
++      haloMat.current.opacity += (target - haloMat.current.opacity) * Math.min(1, dt * 6);
++    }
++    if (core.current) {
++      const s = 5.6 + level * 2.6 + kick * 1.2;
++      core.current.scale.set(s, s, 1);
++    }
++    if (halo.current) {
++      const s = 9.5 + level * 3.5;
++      halo.current.scale.set(s, s, 1);
++    }
++  });
++
++  return (
++    <group>
++      <sprite ref={core}>
++        <spriteMaterial ref={coreMat} map={coreTexture} transparent opacity={0.2} depthWrite={false} blending={THREE.AdditiveBlending} />
++      </sprite>
++      <sprite ref={halo}>
++        <spriteMaterial ref={haloMat} map={haloTexture} transparent opacity={0.08} depthWrite={false} blending={THREE.AdditiveBlending} />
++      </sprite>
++    </group>
+   );
+ }
+ 
+@@ -194,11 +445,14 @@ export default function Scene() {
+       className="scene-canvas"
+       dpr={[1, 2]}
+       gl={{ antialias: true, alpha: true, powerPreference: "high-performance" }}
+-      camera={{ fov: 42, position: [0, 0, 6.4], near: 0.1, far: 50 }}
++      camera={{ fov: 44, position: [0, 0.15, 6.6], near: 0.1, far: 50 }}
+     >
+       <AdaptiveDpr pixelated={false} />
+       <Cage />
+       <ParticleSphere />
++      <SpectrumRing />
++      <GyroRings />
++      <Satellites />
+       <CoreGlow />
+     </Canvas>
+   );
+diff --git a/frontend/src/components/SettingsPanel.tsx b/frontend/src/components/SettingsPanel.tsx
+new file mode 100644
+index 0000000..8388578
+--- /dev/null
++++ b/frontend/src/components/SettingsPanel.tsx
+@@ -0,0 +1,169 @@
++"use client";
++
++/**
++ * Settings panel - model / voice / speed, switchable live.
++ *
++ * Opened by the ⚙ button in the telemetry header, or by saying "settings"
++ * (the backend routes the voice command to a `ui` frame). Changes POST to
++ * /api/settings; every connected client (incl. this one) then receives a
++ * `settings.update` frame, so panels stay in sync and the change is spoken
++ * back by the assistant.
++ */
++
++import { useEffect, useState } from "react";
++import { useJarvis } from "@/state/jarvis";
++import type { LogLevel } from "@/lib/protocol";
++
++type SaveState = "idle" | "saving" | "ok" | "error";
++
++export default function SettingsPanel() {
++  const open = useJarvis((s) => s.settingsOpen);
++  const setOpen = useJarvis((s) => s.setSettingsOpen);
++  const settings = useJarvis((s) => s.settings);
++  const setSettings = useJarvis((s) => s.setSettings);
++  const engines = useJarvis((s) => s.engines);
++  const pushLog = useJarvis((s) => s.pushLog);
++  const [save, setSave] = useState<SaveState>("idle");
++  const [detail, setDetail] = useState("");
++
++  useEffect(() => {
++    if (!open) return;
++    const onKey = (event: KeyboardEvent) => {
++      if (event.key === "Escape") setOpen(false);
++    };
++    window.addEventListener("keydown", onKey);
++    return () => window.removeEventListener("keydown", onKey);
++  }, [open, setOpen]);
++
++  if (!open) return null;
++
++  const apply = async (delta: { model?: string; voice?: string; speed?: number }) => {
++    setSave("saving");
++    setDetail("");
++    try {
++      const res = await fetch("/api/settings", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify(delta),
++      });
++      const data = await res.json();
++      if (!res.ok || !data.ok) throw new Error(data.errors?.[0] ?? `HTTP ${res.status}`);
++      if (data.settings) setSettings(data.settings);
++      setSave("ok");
++      const changed = Object.entries(data.applied ?? {})
++        .map(([k, v]) => `${k} → ${v}`)
++        .join(", ");
++      setDetail(changed ? `applied ${changed}` : "no change");
++      const level: LogLevel = changed ? "success" : "info";
++      pushLog(level, "settings", changed ? `panel: ${changed}` : "panel: no changes");
++    } catch (err) {
++      setSave("error");
++      setDetail(err instanceof Error ? err.message : String(err));
++      pushLog("error", "settings", `panel: ${detail || "update failed"}`);
++    } finally {
++      setTimeout(() => setSave("idle"), 2400);
++    }
++  };
++
++  const statusText =
++    save === "saving" ? "APPLYING…" : save === "ok" ? "APPLIED ✓" : save === "error" ? "REJECTED" : "";
++
++  return (
++    <>
++      <div className="settings-scrim" onClick={() => setOpen(false)} />
++      <section className="settings-panel" role="dialog" aria-label="Settings">
++        <header className="telemetry-header">
++          <span className="telemetry-title">SYSTEM CONFIGURATION</span>
++          <button className="settings-close" onClick={() => setOpen(false)} aria-label="Close settings" type="button">
++            ✕
++          </button>
++        </header>
++
++        <div className="settings-body">
++          <label className="settings-field">
++            <span className="settings-label">
++              CREW MODEL
++              <em className="settings-note">
++                {settings.model_verified ? "verified on ollama" : "unverified — ollama offline or not pulled"}
++              </em>
++            </span>
++            <select
++              value={settings.model}
++              onChange={(event) => apply({ model: event.target.value })}
++              disabled={save === "saving"}
++            >
++              {!settings.models.includes(settings.model) && (
++                <option value={settings.model}>{settings.model}</option>
++              )}
++              {settings.models.map((model) => (
++                <option key={model} value={model}>
++                  {model}
++                  {model === settings.model ? " ●" : ""}
++                </option>
++              ))}
++            </select>
++          </label>
++
++          <label className="settings-field">
++            <span className="settings-label">
++              VOICE
++              <em className="settings-note">applies on the next utterance</em>
++            </span>
++            <select
++              value={settings.voice}
++              onChange={(event) => apply({ voice: event.target.value })}
++              disabled={save === "saving"}
++            >
++              {!settings.voices.includes(settings.voice) && (
++                <option value={settings.voice}>{settings.voice}</option>
++              )}
++              {settings.voices.map((voice) => (
++                <option key={voice} value={voice}>
++                  {voice}
++                  {voice === settings.voice ? " ●" : ""}
++                </option>
++              ))}
++            </select>
++          </label>
++
++          <label className="settings-field">
++            <span className="settings-label">
++              SPEECH SPEED <b className="settings-value">{settings.speed.toFixed(2)}×</b>
++            </span>
++            <input
++              type="range"
++              min={0.5}
++              max={2}
++              step={0.05}
++              value={settings.speed}
++              onChange={(event) => setSettings({ speed: Number(event.target.value) })}
++              onPointerUp={(event) => apply({ speed: Number((event.target as HTMLInputElement).value) })}
++              onKeyUp={(event) => apply({ speed: Number((event.target as HTMLInputElement).value) })}
++              disabled={save === "saving"}
++            />
++            <span className="settings-scale">
++              <span>0.5×</span>
++              <span>1.0×</span>
++              <span>2.0×</span>
++            </span>
++          </label>
++
++          <div className="settings-status">
++            <span>tts/{engines.tts}</span>
++            <span>crew/{engines.agents}</span>
++          </div>
++
++          <p className="settings-hint">
++            Voice: say <i>“settings”</i>, <i>“list models”</i>, <i>“switch model to qwen3
++            8b”</i>, <i>“change voice to af heart”</i>, or <i>“speak slower”</i>.
++          </p>
++        </div>
++
++        <footer className="settings-footer">
++          <span className={`settings-save ${save === "error" ? "bad" : "good"}`}>{statusText}</span>
++          <span className="settings-detail">{detail}</span>
++        </footer>
++      </section>
++    </>
++  );
++}
+diff --git a/frontend/src/components/TelemetryPanel.tsx b/frontend/src/components/TelemetryPanel.tsx
+index 4d6c33d..a6d1575 100644
+--- a/frontend/src/components/TelemetryPanel.tsx
++++ b/frontend/src/components/TelemetryPanel.tsx
+@@ -79,8 +79,19 @@ export default function TelemetryPanel() {
+     <section className="telemetry" data-connected={connected}>
+       <header className="telemetry-header">
+         <span className="telemetry-title">OPERATIONAL TELEMETRY</span>
+-        <span className={`telemetry-link ${connected ? "linked" : ""}`}>
+-          {connected ? "LINKED" : "RECONNECTING"}
++        <span className="telemetry-header-actions">
++          <button
++            className="gear"
++            onClick={() => useJarvis.getState().setSettingsOpen(true)}
++            title="Settings (or say “settings”)"
++            aria-label="Open settings"
++            type="button"
++          >
++            ⚙
++          </button>
++          <span className={`telemetry-link ${connected ? "linked" : ""}`}>
++            {connected ? "LINKED" : "RECONNECTING"}
++          </span>
+         </span>
+       </header>
+ 
+diff --git a/frontend/src/hooks/useJarvisConnection.ts b/frontend/src/hooks/useJarvisConnection.ts
+index 1221734..406135f 100644
+--- a/frontend/src/hooks/useJarvisConnection.ts
++++ b/frontend/src/hooks/useJarvisConnection.ts
+@@ -33,9 +33,20 @@ export function useJarvisConnection(): void {
+   const pushLog = useJarvis((s) => s.pushLog);
+   const setStatus = useJarvis((s) => s.setStatus);
+   const setEngines = useJarvis((s) => s.setEngines);
++  const setSettings = useJarvis((s) => s.setSettings);
++  const setSettingsOpen = useJarvis((s) => s.setSettingsOpen);
+   const setConnected = useJarvis((s) => s.setConnected);
+   const setLatency = useJarvis((s) => s.setLatency);
+ 
++  /* ---------------- initial settings snapshot ---------------- */
++
++  useEffect(() => {
++    fetch("/api/settings")
++      .then((res) => (res.ok ? res.json() : Promise.reject(new Error(String(res.status)))))
++      .then((data) => setSettings(data.settings))
++      .catch(() => undefined);
++  }, []);
++
+   /* ---------------- /ws/logs ---------------- */
+ 
+   useEffect(() => {
+@@ -77,6 +88,7 @@ export function useJarvisConnection(): void {
+               agents: frame.engines.agents,
+               model: frame.engines.model,
+             });
++            if (frame.settings) setSettings(frame.settings);
+             break;
+           case "log":
+             pushLog(frame.level, frame.source, frame.msg);
+@@ -86,6 +98,13 @@ export function useJarvisConnection(): void {
+               setStatus(frame.status as AssistantStatus, frame.detail);
+             }
+             break;
++          case "settings.update":
++            setSettings(frame.settings);
++            setEngines({ model: frame.settings.model });
++            break;
++          case "ui":
++            if (frame.action === "open_settings") setSettingsOpen(true);
++            break;
+           case "pong":
+             if (typeof frame.ts === "number") setLatency(Math.max(0, Date.now() - frame.ts));
+             break;
+@@ -140,6 +159,7 @@ export function useJarvisConnection(): void {
+         switch (frame.type) {
+           case "tts.start":
+             audioEngine.reset();
++            audioEngine.kick();
+             pushLog("voice", "tts", `◀ stream ${frame.utterance_id} [${frame.engine}] "${frame.text.slice(0, 60)}"`);
+             audioEngine.unlock();
+             break;
+diff --git a/frontend/src/lib/protocol.ts b/frontend/src/lib/protocol.ts
+index bfb81a7..2d9a66d 100644
+--- a/frontend/src/lib/protocol.ts
++++ b/frontend/src/lib/protocol.ts
+@@ -14,11 +14,21 @@ export interface LogLine {
+ 
+ /* ---- /ws/logs ---- */
+ 
++export interface SettingsState {
++  model: string;
++  model_verified: boolean;
++  models: string[];
++  voice: string;
++  voices: string[];
++  speed: number;
++}
++
+ export interface HelloFrame {
+   type: "hello";
+   name: string;
+   version: string;
+   engines: { tts: string; tts_mode: string; agents: string; model: string };
++  settings?: SettingsState;
+ }
+ 
+ export interface LogFrame {
+@@ -35,7 +45,23 @@ export interface StatusFrame {
+   detail?: string;
+ }
+ 
+-export type LogsServerFrame = HelloFrame | LogFrame | StatusFrame | { type: "pong"; ts: number };
++export interface SettingsUpdateFrame {
++  type: "settings.update";
++  settings: SettingsState;
++}
++
++export interface UiFrame {
++  type: "ui";
++  action: "open_settings" | string;
++}
++
++export type LogsServerFrame =
++  | HelloFrame
++  | LogFrame
++  | StatusFrame
++  | SettingsUpdateFrame
++  | UiFrame
++  | { type: "pong"; ts?: number };
+ 
+ export interface CommandFrame {
+   type: "command" | "speak";
+diff --git a/frontend/src/state/jarvis.ts b/frontend/src/state/jarvis.ts
+index 9453faa..f916036 100644
+--- a/frontend/src/state/jarvis.ts
++++ b/frontend/src/state/jarvis.ts
+@@ -7,7 +7,7 @@
+  */
+ 
+ import { create } from "zustand";
+-import type { AssistantStatus, LogLevel, LogLine } from "@/lib/protocol";
++import type { AssistantStatus, LogLevel, LogLine, SettingsState } from "@/lib/protocol";
+ 
+ const MAX_LOGS = 160;
+ 
+@@ -23,6 +23,8 @@ interface JarvisState {
+   statusDetail: string;
+   logs: LogLine[];
+   engines: Engines;
++  settings: SettingsState;
++  settingsOpen: boolean;
+   logsConnected: boolean;
+   audioConnected: boolean;
+   latencyMs: number | null;
+@@ -30,6 +32,8 @@ interface JarvisState {
+   pushLog: (level: LogLevel, source: string, msg: string) => void;
+   setStatus: (status: AssistantStatus, detail?: string) => void;
+   setEngines: (engines: Partial<Engines>) => void;
++  setSettings: (settings: Partial<SettingsState>) => void;
++  setSettingsOpen: (open: boolean) => void;
+   setConnected: (socket: "logs" | "audio", connected: boolean) => void;
+   setLatency: (ms: number | null) => void;
+   clearLogs: () => void;
+@@ -42,6 +46,15 @@ export const useJarvis = create<JarvisState>((set) => ({
+   statusDetail: "",
+   logs: [],
+   engines: { tts: "…", ttsMode: "", agents: "…", model: "" },
++  settings: {
++    model: "",
++    model_verified: false,
++    models: [],
++    voice: "",
++    voices: [],
++    speed: 1,
++  },
++  settingsOpen: false,
+   logsConnected: false,
+   audioConnected: false,
+   latencyMs: null,
+@@ -62,6 +75,11 @@ export const useJarvis = create<JarvisState>((set) => ({
+   setEngines: (engines) =>
+     set((state) => ({ engines: { ...state.engines, ...engines } })),
+ 
++  setSettings: (settings) =>
++    set((state) => ({ settings: { ...state.settings, ...settings } })),
++
++  setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
++
+   setConnected: (socket, connected) =>
+     set(socket === "logs" ? { logsConnected: connected } : { audioConnected: connected }),
+ 
+-- 
+2.39.5
+

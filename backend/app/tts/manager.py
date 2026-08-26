@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -84,6 +85,7 @@ class TTSManager:
         frames = 0
         samples = 0
         producer: asyncio.Future | None = None
+        stop = threading.Event()
         self._broadcast({
             "type": "tts.start",
             "utterance_id": utterance_id,
@@ -95,18 +97,30 @@ class TTSManager:
         self.bus.publish("voice", "tts", f"synthesising {len(text)} chars with {self.engine.name}")
         try:
             queue: asyncio.Queue[SpeechChunk | None] = asyncio.Queue(maxsize=32)
-
             loop = asyncio.get_running_loop()
+
+            def safe_put(item: SpeechChunk | None) -> None:
+                """Thread-safe enqueue that never raises into the loop."""
+                try:
+                    queue.put_nowait(item)
+                except asyncio.QueueFull:
+                    try:
+                        queue.get_nowait()
+                        queue.put_nowait(item)
+                    except Exception:  # pragma: no cover - defensive
+                        pass
 
             def produce() -> None:
                 try:
                     for chunk in self.engine.stream(text):
-                        loop.call_soon_threadsafe(lambda c=chunk: queue.put_nowait(c))
+                        if stop.is_set():
+                            return
+                        loop.call_soon_threadsafe(safe_put, chunk)
                 except Exception as exc:  # noqa: BLE001
                     err = exc
-                    loop.call_soon_threadsafe(lambda: queue.put_nowait(_Errored(err)))
+                    loop.call_soon_threadsafe(safe_put, _Errored(err))
                     return
-                loop.call_soon_threadsafe(lambda: queue.put_nowait(None))
+                loop.call_soon_threadsafe(safe_put, None)
 
             producer = loop.run_in_executor(None, produce)
             while True:
@@ -147,6 +161,7 @@ class TTSManager:
             self._broadcast({"type": "tts.error", "utterance_id": utterance_id, "detail": str(exc)})
             self.bus.publish("error", "tts", f"synthesis failed: {type(exc).__name__}: {exc}")
         finally:
+            stop.set()  # halt the producer thread promptly on cancel/exit
             if producer is not None:
                 await asyncio.gather(producer, return_exceptions=True)
             elapsed = time.monotonic() - started

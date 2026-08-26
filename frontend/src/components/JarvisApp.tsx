@@ -5,6 +5,7 @@
 import dynamic from "next/dynamic";
 import Hud from "./Hud";
 import MathAnchor from "./MathAnchor";
+import SettingsPanel from "./SettingsPanel";
 import TelemetryPanel from "./TelemetryPanel";
 import { useJarvisConnection } from "@/hooks/useJarvisConnection";
 import { useJarvis } from "@/state/jarvis";
@@ -23,6 +24,7 @@ export default function JarvisApp() {
       </div>
       <Hud />
       <TelemetryPanel />
+      <SettingsPanel />
       <MathAnchor />
       <div className={`boot-veil ${logsConnected ? "gone" : ""}`}>
         <span>ESTABLISHING UPLINK</span>

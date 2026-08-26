@@ -14,11 +14,21 @@ export interface LogLine {
 
 /* ---- /ws/logs ---- */
 
+export interface SettingsState {
+  model: string;
+  model_verified: boolean;
+  models: string[];
+  voice: string;
+  voices: string[];
+  speed: number;
+}
+
 export interface HelloFrame {
   type: "hello";
   name: string;
   version: string;
   engines: { tts: string; tts_mode: string; agents: string; model: string };
+  settings?: SettingsState;
 }
 
 export interface LogFrame {
@@ -35,7 +45,23 @@ export interface StatusFrame {
   detail?: string;
 }
 
-export type LogsServerFrame = HelloFrame | LogFrame | StatusFrame | { type: "pong"; ts: number };
+export interface SettingsUpdateFrame {
+  type: "settings.update";
+  settings: SettingsState;
+}
+
+export interface UiFrame {
+  type: "ui";
+  action: "open_settings" | string;
+}
+
+export type LogsServerFrame =
+  | HelloFrame
+  | LogFrame
+  | StatusFrame
+  | SettingsUpdateFrame
+  | UiFrame
+  | { type: "pong"; ts?: number };
 
 export interface CommandFrame {
   type: "command" | "speak";

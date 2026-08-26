@@ -46,7 +46,8 @@ class KokoroEngine:
 
     def __init__(self, pipeline, voice: str, library: str) -> None:
         self._pipeline = pipeline
-        self.voice = voice
+        self.voice = voice  # mutable - the registry can hot-swap this
+        self.speed = settings.tts_speed  # mutable - registry-controlled
         self.library = library  # "pykokoro" | "kokoro"
 
     @property
@@ -93,7 +94,7 @@ class KokoroEngine:
 
     def stream(self, text: str) -> Iterator[SpeechChunk]:
         text = self._clean(text)
-        generator = self._pipeline(text, voice=self.voice, speed=settings.tts_speed)
+        generator = self._pipeline(text, voice=self.voice, speed=self.speed)
         for result in generator:
             audio = _to_numpy(getattr(result, "audio", None))
             if audio.size == 0:

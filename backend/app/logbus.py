@@ -82,6 +82,19 @@ class LogBus:
             "ts": time.time(),
         }
 
+    def push_frame(self, frame: dict[str, Any]) -> None:
+        """Push an arbitrary JSON frame (status / settings / ui control) to
+        every telemetry subscriber, bypassing the log backlog."""
+        for q in list(self.subscribers):
+            try:
+                q.put_nowait(frame)
+            except asyncio.QueueFull:
+                try:
+                    q.get_nowait()
+                    q.put_nowait(frame)
+                except Exception:  # pragma: no cover - defensive
+                    pass
+
     async def events(self, q: asyncio.Queue) -> AsyncIterator[LogEvent]:
         while True:
             yield await q.get()

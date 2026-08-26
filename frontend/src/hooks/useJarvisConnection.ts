@@ -33,8 +33,19 @@ export function useJarvisConnection(): void {
   const pushLog = useJarvis((s) => s.pushLog);
   const setStatus = useJarvis((s) => s.setStatus);
   const setEngines = useJarvis((s) => s.setEngines);
+  const setSettings = useJarvis((s) => s.setSettings);
+  const setSettingsOpen = useJarvis((s) => s.setSettingsOpen);
   const setConnected = useJarvis((s) => s.setConnected);
   const setLatency = useJarvis((s) => s.setLatency);
+
+  /* ---------------- initial settings snapshot ---------------- */
+
+  useEffect(() => {
+    fetch("/api/settings")
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error(String(res.status)))))
+      .then((data) => setSettings(data.settings))
+      .catch(() => undefined);
+  }, []);
 
   /* ---------------- /ws/logs ---------------- */
 
@@ -77,6 +88,7 @@ export function useJarvisConnection(): void {
               agents: frame.engines.agents,
               model: frame.engines.model,
             });
+            if (frame.settings) setSettings(frame.settings);
             break;
           case "log":
             pushLog(frame.level, frame.source, frame.msg);
@@ -85,6 +97,13 @@ export function useJarvisConnection(): void {
             if (["thinking", "speaking", "idle"].includes(frame.status)) {
               setStatus(frame.status as AssistantStatus, frame.detail);
             }
+            break;
+          case "settings.update":
+            setSettings(frame.settings);
+            setEngines({ model: frame.settings.model });
+            break;
+          case "ui":
+            if (frame.action === "open_settings") setSettingsOpen(true);
             break;
           case "pong":
             if (typeof frame.ts === "number") setLatency(Math.max(0, Date.now() - frame.ts));
@@ -140,6 +159,7 @@ export function useJarvisConnection(): void {
         switch (frame.type) {
           case "tts.start":
             audioEngine.reset();
+            audioEngine.kick();
             pushLog("voice", "tts", `◀ stream ${frame.utterance_id} [${frame.engine}] "${frame.text.slice(0, 60)}"`);
             audioEngine.unlock();
             break;
