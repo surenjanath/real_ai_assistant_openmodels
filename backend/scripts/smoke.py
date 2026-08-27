@@ -6,9 +6,11 @@ Boots nothing itself - point it at a running server:
     python scripts/smoke.py [--url http://127.0.0.1:8000]
 
 Verifies: health, the settings registry (including the extended-thinking
-toggle), real host vitals, control-intent routing, barge-in, and - most
-importantly - that the vocal engine actually produces audible speech rather
-than silently degrading to the fallback synth.
+toggle), real host vitals, control-intent routing, barge-in, the cognitive
+graph, the skill sandbox boundaries, durable memory round-trips, the
+deterministic reflex arc, and - most importantly - that the vocal engine
+actually produces audible speech rather than silently degrading to the
+fallback synth.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import argparse
 import asyncio
 import base64
 import json
+import pathlib
 import sys
 import time
 import urllib.request
@@ -52,6 +55,12 @@ def _post(url: str, body: dict, timeout: float = 30.0) -> dict:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _delete(url: str, timeout: float = 15.0) -> dict:
+    req = urllib.request.Request(url, method="DELETE")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
@@ -103,11 +112,17 @@ async def check_settings(base: str) -> None:
         ok("settings - model_verified agrees with the installed list")
 
     new_voice = next(v for v in original["voices"] if v != original["voice"])
-    result = _post(f"{base}/api/settings", {"voice": new_voice, "speed": 1.15})
-    if not (result["ok"] and "voice" in result["applied"] and "speed" in result["applied"]):
-        bad(f"settings write - {result}")
+    # Pick a speed that is definitely not the current one: applying the value
+    # already in force is a legitimate no-op, and asserting on it made this
+    # check fail purely because of whatever the last session left behind.
+    new_speed = 1.15 if abs(original["speed"] - 1.15) > 0.01 else 1.25
+    result = _post(f"{base}/api/settings", {"voice": new_voice, "speed": new_speed})
+    applied = result.get("applied", {})
+    if not (result["ok"] and applied.get("voice") == new_voice
+            and abs(applied.get("speed", -1) - new_speed) < 0.01):
+        bad(f"settings write - applied={applied} errors={result.get('errors')}")
     else:
-        ok(f"settings write - {result['applied']}")
+        ok(f"settings write - {applied}")
 
     # Extended thinking must be togglable and default to off (it is ~28x slower).
     if original.get("think"):
@@ -248,6 +263,157 @@ async def check_audio(base: str, wav_path: str | None) -> None:
             ok(f"audio written to {wav_path} - play it to confirm the voice by ear")
 
 
+async def check_neural(base: str) -> None:
+    """The cognitive graph must be a connected architecture, not a node soup."""
+    data = _get(f"{base}/api/neural")
+    nodes = {n["id"] for n in data.get("nodes", [])}
+    edges = data.get("edges", [])
+    if len(nodes) < 10 or not edges:
+        bad(f"neural - graph too small: {len(nodes)} nodes, {len(edges)} edges")
+        return
+
+    dangling = [e for e in edges if e["from"] not in nodes or e["to"] not in nodes]
+    if dangling:
+        bad(f"neural - {len(dangling)} edge(s) reference missing nodes, e.g. {dangling[0]}")
+        return
+
+    # Every node should be reachable from a sensory root, or the interface will
+    # draw an island that never lights up.
+    linked = {e["from"] for e in edges} | {e["to"] for e in edges}
+    orphans = nodes - linked
+    if orphans:
+        bad(f"neural - unconnected node(s): {sorted(orphans)}")
+        return
+    regions = {n["region"] for n in data["nodes"]}
+    ok(f"neural - {len(nodes)} nodes / {len(edges)} edges across {len(regions)} regions, fully connected")
+
+
+async def check_skills(base: str) -> None:
+    """The skill kit, and the boundaries it must refuse to cross."""
+    data = _get(f"{base}/api/skills")
+    if not data.get("ok") or not data.get("skills"):
+        bad(f"skills - catalogue unavailable: {data}")
+        return
+    names = [s["name"] for s in data["skills"]]
+    ok(f"skills - {len(names)} registered, workspace={data['workspace']}")
+
+    result = _post(f"{base}/api/skills/calculate", {"arguments": {"expression": "48271*9912"}})
+    if result.get("ok") and result["result"]["value"] == 478462152:
+        ok("skills - calculate returns an exact result")
+    else:
+        bad(f"skills - calculate wrong: {result}")
+
+    # Sandbox: escaping the workspace and reading credentials must both fail.
+    escape = _post(f"{base}/api/skills/read_file", {"arguments": {"path": "/etc/passwd"}})
+    if escape.get("ok"):
+        bad("skills - read_file escaped the workspace root")
+    else:
+        ok("skills - read_file refuses paths outside the workspace")
+
+    secret = _post(f"{base}/api/skills/read_file", {"arguments": {"path": ".ssh/id_rsa"}})
+    if secret.get("ok"):
+        bad("skills - read_file served a credential file")
+    else:
+        ok("skills - read_file refuses credential paths")
+
+    if not data.get("shell") and "run_command" in names:
+        bad("skills - run_command is exposed although shell execution is disabled")
+    else:
+        ok(f"skills - shell {'enabled' if data.get('shell') else 'gated off'}, "
+           f"network {'enabled' if data.get('network') else 'gated off'}")
+
+
+async def check_memory(base: str) -> None:
+    """Durable memory: write a fact, read it back, then clean up after itself."""
+    stats = _get(f"{base}/api/memory")
+    if not stats.get("ok"):
+        warn("memory - long-term store unavailable; recall features are disabled")
+        return
+    ok(f"memory - {stats['stats']['turns']} turns, "
+       f"{'fts5' if stats['stats']['fts'] else 'scan'} recall, {stats['stats']['size_kb']} KB")
+
+    marker = f"smoke-probe-{int(time.time())}"
+    written = _post(f"{base}/api/skills/remember",
+                    {"arguments": {"key": marker, "value": "the smoke test was here"}})
+    if not written.get("ok"):
+        bad(f"memory - could not store a fact: {written}")
+        return
+
+    read_back = _post(f"{base}/api/skills/recall", {"arguments": {"query": marker}})
+    if read_back.get("ok") and read_back["result"].get("fact"):
+        ok("memory - a stored fact survives a round-trip through recall")
+    else:
+        bad(f"memory - stored fact did not come back: {read_back}")
+
+    # Leave the operator's store exactly as it was found.
+    _delete(f"{base}/api/facts/{marker}")
+
+    note = _post(f"{base}/api/notes", {"text": f"{marker} note"})
+    if note.get("ok"):
+        _delete(f"{base}/api/notes/{note['id']}")
+        ok("memory - notes can be created and deleted")
+    else:
+        bad(f"memory - note creation failed: {note}")
+
+
+async def check_reflex(base: str) -> None:
+    """The reflex arc must ground arithmetic before the model ever sees it.
+
+    This is the check that matters most for correctness: the model alone gets
+    large products wrong, and does not reliably choose to call a tool.
+    """
+    root = pathlib.Path(__file__).resolve().parent.parent
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    try:
+        # Imported as part of the package: reflexes.py imports `.skills`.
+        from app import reflexes as module  # noqa: PLC0415 - check-local
+    except ImportError as exc:
+        warn(f"reflex - could not import the reflex module ({exc})")
+        return
+
+    grounded = module.detect("what is 48271 multiplied by 9912?")
+    if any("478,462,152" in r.detail for r in grounded):
+        ok("reflex - large arithmetic is grounded exactly before the cortex runs")
+    else:
+        bad(f"reflex - arithmetic was not grounded: {[r.detail for r in grounded]}")
+
+    if module.detect("tell me about the roman empire"):
+        bad("reflex - fired on a question with nothing to ground")
+    else:
+        ok("reflex - stays silent when there is nothing to compute")
+
+
+async def check_personas(base: str) -> None:
+    data = _get(f"{base}/api/personas")
+    if not data.get("ok") or len(data.get("personas", [])) < 2:
+        bad(f"personas - {data}")
+        return
+    original = data["current"]
+    other = next(p["key"] for p in data["personas"] if p["key"] != original)
+    applied = _post(f"{base}/api/settings", {"persona": other})
+    if applied.get("applied", {}).get("persona") == other:
+        ok(f"personas - switched {original} -> {other}")
+    else:
+        bad(f"personas - switch rejected: {applied}")
+    rejected = _post(f"{base}/api/settings", {"persona": "not-a-persona"})
+    if rejected.get("errors"):
+        ok("personas - an unknown name is refused rather than silently defaulted")
+    else:
+        bad("personas - unknown name was accepted")
+    _post(f"{base}/api/settings", {"persona": original})
+
+
+async def check_metrics(base: str) -> None:
+    data = _get(f"{base}/api/metrics")
+    for key in ("commands", "ttft_ms", "total_ms", "tok_s", "history"):
+        if key not in data:
+            bad(f"metrics - missing '{key}'")
+            return
+    ok(f"metrics - {data['commands']} directives measured, "
+       f"p50 first word {data['ttft_ms']['p50']}ms, {data['tok_s']['avg']} tok/s")
+
+
 async def check_stop(base: str) -> None:
     """Barge-in should be accepted whether or not anything is in flight."""
     result = _post(f"{base}/api/stop", {})
@@ -272,7 +438,13 @@ async def main() -> int:
         await check_health(base)
         await check_vitals(base)
         await check_settings(base)
+        await check_neural(base)
+        await check_skills(base)
+        await check_memory(base)
+        await check_reflex(base)
+        await check_personas(base)
         await check_logs_and_command(base)
+        await check_metrics(base)
         await check_audio(base, args.wav)
         await check_stop(base)
     except Exception as exc:  # noqa: BLE001

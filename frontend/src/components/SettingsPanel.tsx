@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * Settings panel - model / voice / speed / volume, switchable live.
+ * Settings panel - model, voice, persona, skills, memory and output, live.
  *
  * Opened by the ⚙ button in the telemetry header, or by saying "settings"
  * (the backend routes the voice command to a `ui` frame). Changes POST to
@@ -10,12 +10,18 @@
  *
  * Models are split into what Ollama actually has installed versus mere
  * suggestions, because picking an un-pulled tag is the single easiest way to
- * end up with a crew that cannot answer.
+ * end up with a crew that cannot answer. The same honesty applies to the
+ * reasoning toggles: extended thinking and tool calling are both disabled,
+ * with the reason shown, when the selected model does not advertise them.
+ *
+ * Volume lives in the backend registry rather than in local component state,
+ * so "speak up" by voice and the slider here move the same number, and every
+ * open client agrees on it.
  */
 
 import { useEffect, useState } from "react";
 import { audioEngine } from "@/audio/engine";
-import { useJarvis } from "@/state/jarvis";
+import { THEMES, useJarvis, type Theme } from "@/state/jarvis";
 import type { LogLevel } from "@/lib/protocol";
 
 type SaveState = "idle" | "saving" | "ok" | "error";
@@ -28,9 +34,13 @@ export default function SettingsPanel() {
   const engines = useJarvis((s) => s.engines);
   const pushLog = useJarvis((s) => s.pushLog);
 
+  const theme = useJarvis((s) => s.theme);
+  const setTheme = useJarvis((s) => s.setTheme);
+  const skills = useJarvis((s) => s.skills);
+  const memoryStats = useJarvis((s) => s.memoryStats);
+
   const [save, setSave] = useState<SaveState>("idle");
   const [detail, setDetail] = useState("");
-  const [volume, setVolume] = useState(0.9);
   const [muted, setMuted] = useState(false);
 
   useEffect(() => {
@@ -49,6 +59,10 @@ export default function SettingsPanel() {
     voice?: string;
     speed?: number;
     think?: boolean;
+    persona?: string;
+    tools?: boolean;
+    recall?: boolean;
+    volume?: number;
   }) => {
     setSave("saving");
     setDetail("");
@@ -202,20 +216,127 @@ export default function SettingsPanel() {
 
           <label className="settings-field">
             <span className="settings-label">
-              OUTPUT VOLUME <b className="settings-value">{Math.round(volume * 100)}%</b>
+              OUTPUT VOLUME <b className="settings-value">{Math.round(settings.volume * 100)}%</b>
+              <em className="settings-note">shared with “louder” / “quieter” by voice</em>
             </span>
             <input
               type="range"
               min={0}
               max={1}
               step={0.05}
-              value={volume}
+              value={settings.volume}
               onChange={(event) => {
+                // Apply locally on every drag frame so it is audible at once,
+                // and persist to the registry only when the gesture ends.
                 const v = Number(event.target.value);
-                setVolume(v);
+                setSettings({ volume: v });
                 audioEngine.setVolume(v);
               }}
+              onPointerUp={(event) => apply({ volume: Number((event.target as HTMLInputElement).value) })}
+              onKeyUp={(event) => apply({ volume: Number((event.target as HTMLInputElement).value) })}
             />
+          </label>
+
+          <div className="settings-field">
+            <span className="settings-label">
+              COLOUR SCHEME
+              <em className="settings-note">interface only — remembered on this device</em>
+            </span>
+            <div className="theme-row">
+              {THEMES.map((name) => (
+                <button
+                  key={name}
+                  type="button"
+                  className={`theme-chip ${theme === name ? "on" : ""}`}
+                  data-theme-swatch={name}
+                  onClick={() => setTheme(name as Theme)}
+                >
+                  {name}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="settings-field">
+            <span className="settings-label">
+              DISPOSITION
+              <em className="settings-note">
+                the same crew, a different manner — switches instantly
+              </em>
+            </span>
+            <div className="persona-grid">
+              {(settings.personas ?? []).map((persona) => (
+                <button
+                  key={persona.key}
+                  type="button"
+                  className={`persona ${settings.persona === persona.key ? "on" : ""}`}
+                  onClick={() => apply({ persona: persona.key })}
+                  disabled={save === "saving"}
+                  title={persona.blurb}
+                >
+                  <b>{persona.label}</b>
+                  <em>{persona.blurb}</em>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <label className="settings-field">
+            <span className="settings-label">
+              SKILLS
+              <em className={`settings-note ${settings.tools_supported ? "" : "bad"}`}>
+                {settings.tools_supported
+                  ? `${skills.length} available — the cortex calls them itself`
+                  : "this model does not advertise tool calling"}
+              </em>
+            </span>
+            <div className="toggle-row">
+              <button
+                type="button"
+                className={`toggle ${!settings.tools ? "on" : ""}`}
+                onClick={() => apply({ tools: false })}
+                disabled={save === "saving"}
+              >
+                OFF · model only
+              </button>
+              <button
+                type="button"
+                className={`toggle ${settings.tools ? "on" : ""}`}
+                onClick={() => apply({ tools: true })}
+                disabled={save === "saving" || !settings.tools_supported}
+              >
+                ON · armed
+              </button>
+            </div>
+          </label>
+
+          <label className="settings-field">
+            <span className="settings-label">
+              LONG-TERM RECALL
+              <em className="settings-note">
+                {memoryStats
+                  ? `${memoryStats.turns} exchanges across ${memoryStats.sessions} sessions`
+                  : "durable memory across restarts"}
+              </em>
+            </span>
+            <div className="toggle-row">
+              <button
+                type="button"
+                className={`toggle ${!settings.recall ? "on" : ""}`}
+                onClick={() => apply({ recall: false })}
+                disabled={save === "saving"}
+              >
+                OFF · this session
+              </button>
+              <button
+                type="button"
+                className={`toggle ${settings.recall ? "on" : ""}`}
+                onClick={() => apply({ recall: true })}
+                disabled={save === "saving"}
+              >
+                ON · remembers
+              </button>
+            </div>
           </label>
 
           <label className="settings-field">
@@ -276,11 +397,13 @@ export default function SettingsPanel() {
           </div>
 
           <p className="settings-hint">
-            Voice: say <i>“settings”</i>, <i>“list models”</i>, <i>“switch model to qwen3
-            8b”</i>, <i>“change voice to af heart”</i>, <i>“speak slower”</i>,{" "}
-            <i>“think harder”</i>, <i>“answer faster”</i>, or <i>“stop”</i>.
+            Voice: <i>“settings”</i>, <i>“switch model to qwen3 8b”</i>, <i>“change voice to
+            af heart”</i>, <i>“be more concise”</i>, <i>“remember that …”</i>, <i>“what do
+            you know about …”</i>, <i>“remind me to … in ten minutes”</i>,{" "}
+            <i>“performance report”</i>, <i>“stop”</i>.
             <br />
-            Keys: <b>/</b> focus · <b>Esc</b> stop speech · <b>⌘K</b> wake word.
+            Keys: <b>/</b> focus · <b>⌘P</b> command palette · <b>⌘K</b> wake word ·{" "}
+            <b>Esc</b> stop speech.
           </p>
         </div>
 

@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 
 from .config import settings
 from .logbus import LogBus
+from .personas import catalogue as persona_catalogue, find as find_persona
 
 # Suggestions only - shown in the picker, never treated as installed.
 DEFAULT_MODELS = [
@@ -89,6 +90,14 @@ class Registry:
     voices: list[str] = field(default_factory=lambda: list(KOKORO_VOICES))
     #: extended chain-of-thought, opt-in (see Settings.think)
     think: bool = field(default_factory=lambda: settings.think)
+    #: selected personality key (see personas.py)
+    persona: str = field(default_factory=lambda: settings.persona)
+    #: whether the cortex may call skills natively
+    tools: bool = field(default_factory=lambda: settings.tools)
+    #: whether durable cross-session recall is injected into prompts
+    recall: bool = field(default_factory=lambda: settings.recall)
+    #: playback gain 0..1, mirrored onto the interface
+    volume: float = field(default_factory=lambda: settings.volume)
     #: model tag -> capability list, as reported by Ollama /api/tags
     capabilities: dict[str, list[str]] = field(default_factory=dict)
     _engine: object | None = None
@@ -106,6 +115,15 @@ class Registry:
     @property
     def think_active(self) -> bool:
         return self.think and self.think_supported
+
+    @property
+    def tools_supported(self) -> bool:
+        """Whether the current model advertises native tool calling."""
+        return "tools" in self.capabilities.get(self.model, [])
+
+    @property
+    def tools_active(self) -> bool:
+        return self.tools and self.tools_supported
 
     # ---- discovery -----------------------------------------------------------
 
@@ -208,6 +226,10 @@ class Registry:
         voice: str | None = None,
         speed: float | None = None,
         think: bool | None = None,
+        persona: str | None = None,
+        tools: bool | None = None,
+        recall: bool | None = None,
+        volume: float | None = None,
         announce: bool = True,
     ) -> dict:
         """Validate + apply a settings delta; logs and broadcasts every change."""
@@ -249,6 +271,35 @@ class Registry:
                 self.think = want
                 applied["think"] = want
 
+        if persona:
+            resolved_persona = find_persona(persona)
+            if resolved_persona is None:
+                errors.append(f"unknown persona '{persona.strip()}'")
+            elif resolved_persona.key != self.persona:
+                self.persona = resolved_persona.key
+                applied["persona"] = resolved_persona.key
+
+        if tools is not None:
+            want = bool(tools)
+            if want and not self.tools_supported:
+                errors.append(f"'{self.model}' does not advertise tool calling")
+            elif want != self.tools:
+                self.tools = want
+                applied["tools"] = want
+
+        if recall is not None and bool(recall) != self.recall:
+            self.recall = bool(recall)
+            applied["recall"] = self.recall
+
+        if volume is not None:
+            try:
+                volume_f = max(0.0, min(1.0, round(float(volume), 2)))
+                if abs(volume_f - self.volume) > 0.001:
+                    self.volume = volume_f
+                    applied["volume"] = volume_f
+            except (TypeError, ValueError):
+                errors.append(f"invalid volume '{volume}'")
+
         if applied:
             self._mirror_engine()
             if announce:
@@ -277,4 +328,11 @@ class Registry:
             "think": self.think,
             "think_supported": self.think_supported,
             "think_active": self.think_active,
+            "persona": self.persona,
+            "personas": persona_catalogue(),
+            "tools": self.tools,
+            "tools_supported": self.tools_supported,
+            "tools_active": self.tools_active,
+            "recall": self.recall,
+            "volume": self.volume,
         }

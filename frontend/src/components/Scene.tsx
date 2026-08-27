@@ -28,6 +28,8 @@ import { AdaptiveDpr } from "@react-three/drei";
 import * as THREE from "three";
 import { audioEngine } from "@/audio/engine";
 import { audioLevels, BAND_COUNT, WAVE_COUNT } from "@/audio/levels";
+import NeuralMesh from "./NeuralMesh";
+import { sceneColors, stepSceneTheme } from "@/state/theme";
 
 const TAU = Math.PI * 2;
 
@@ -141,6 +143,7 @@ const haloGlowTexture = () =>
 function Starfield() {
   const dot = useMemo(dotTexture, []);
   const group = useRef<THREE.Points>(null);
+  const material = useRef<THREE.PointsMaterial>(null);
   const geometry = useMemo(() => {
     const count = 520;
     const positions = new Float32Array(count * 3);
@@ -160,11 +163,13 @@ function Starfield() {
 
   useFrame((_, dt) => {
     if (group.current) group.current.rotation.y += dt * 0.006;
+    if (material.current) material.current.color.copy(sceneColors.dust);
   });
 
   return (
     <points ref={group} geometry={geometry}>
       <pointsMaterial
+        ref={material}
         map={dot}
         color="#7fa8dd"
         size={0.09}
@@ -310,6 +315,9 @@ function ParticleCore() {
   useFrame((state, dt) => {
     // One tick per frame, before anything reads the levels.
     audioEngine.tick(dt, state.clock.elapsedTime);
+    // Ease the palette here as well, so a theme switch cross-fades the whole
+    // scene rather than snapping it.
+    stepSceneTheme(dt);
     const { level, bass, treble, kick, speaking, thinking } = audioLevels;
 
     const u = material.uniforms;
@@ -320,6 +328,8 @@ function ParticleCore() {
     u.uKick.value = kick;
     u.uThinking.value = thinking;
     u.uOpacity.value = Math.min(0.95, 0.52 + level * 0.4 + treble * 0.16);
+    (u.uColorHot.value as THREE.Color).copy(sceneColors.core);
+    (u.uColorRim.value as THREE.Color).copy(sceneColors.rim);
     // Convert a world-space point diameter into DEVICE pixels for this
     // projection (gl_PointSize is device px, so the DPR must be folded in):
     //   px = worldSize * (deviceHeight / (2 tan(fov/2))) / distance
@@ -363,10 +373,14 @@ function Reactor() {
     if (coreMat.current) {
       const target = Math.min(0.5, 0.10 + level * 0.42 + kick * 0.16 + thinking * 0.12);
       coreMat.current.opacity += (target - coreMat.current.opacity) * Math.min(1, dt * 9);
+      // The glow textures are painted white-ish, so tinting the material
+      // multiplies them into the current palette for free.
+      coreMat.current.color.copy(sceneColors.hot);
     }
     if (haloMat.current) {
       const target = Math.min(0.34, 0.05 + level * 0.26 + thinking * 0.09);
       haloMat.current.opacity += (target - haloMat.current.opacity) * Math.min(1, dt * 6);
+      haloMat.current.color.copy(sceneColors.rim);
     }
     if (core.current) {
       const s = 3.4 + level * 1.8 + kick * 0.9;
@@ -385,6 +399,7 @@ function Reactor() {
     }
     if (seedMat.current) {
       seedMat.current.opacity = Math.min(0.85, 0.34 + level * 0.45);
+      seedMat.current.color.copy(sceneColors.core);
     }
   });
 
@@ -461,7 +476,10 @@ function SpectrumBars() {
     attr.needsUpdate = true;
 
     if (lines.current) lines.current.rotation.z = t * 0.12;
-    if (material.current) material.current.opacity = 0.42 + audioLevels.level * 0.5;
+    if (material.current) {
+      material.current.opacity = 0.42 + audioLevels.level * 0.5;
+      material.current.color.copy(sceneColors.hot);
+    }
   });
 
   return (
@@ -509,6 +527,7 @@ function WaveRing() {
     }
     if (material.current) {
       material.current.opacity = 0.34 + audioLevels.level * 0.6;
+      material.current.color.copy(sceneColors.core);
     }
   });
 
@@ -560,9 +579,18 @@ function HudRings() {
     if (dashOuter.current) dashOuter.current.rotation.z += dt * (0.22 + thinking * 0.9);
     if (dashInner.current) dashInner.current.rotation.z -= dt * (0.34 + thinking * 1.3);
     const glow = 0.3 + level * 0.35 + thinking * 0.22;
-    if (tickMat.current) tickMat.current.opacity = Math.min(0.6, glow * 0.8);
-    if (outerMat.current) outerMat.current.opacity = Math.min(0.8, glow + 0.06 + Math.sin(t * 1.6) * 0.03);
-    if (innerMat.current) innerMat.current.opacity = Math.min(0.75, glow);
+    if (tickMat.current) {
+      tickMat.current.opacity = Math.min(0.6, glow * 0.8);
+      tickMat.current.color.copy(sceneColors.rim);
+    }
+    if (outerMat.current) {
+      outerMat.current.opacity = Math.min(0.8, glow + 0.06 + Math.sin(t * 1.6) * 0.03);
+      outerMat.current.color.copy(sceneColors.ring);
+    }
+    if (innerMat.current) {
+      innerMat.current.opacity = Math.min(0.75, glow);
+      innerMat.current.color.copy(sceneColors.hot);
+    }
   });
 
   return (
@@ -624,9 +652,18 @@ function GyroRings() {
       c.current.rotation.z += dt * 0.28 * spin;
     }
     const glow = 0.16 + audioLevels.level * 0.38 + audioLevels.treble * 0.18;
-    if (matA.current) matA.current.opacity = Math.min(0.6, glow);
-    if (matB.current) matB.current.opacity = Math.min(0.5, glow * 0.8);
-    if (matC.current) matC.current.opacity = Math.min(0.4, glow * 0.62);
+    if (matA.current) {
+      matA.current.opacity = Math.min(0.6, glow);
+      matA.current.color.copy(sceneColors.ring);
+    }
+    if (matB.current) {
+      matB.current.opacity = Math.min(0.5, glow * 0.8);
+      matB.current.color.copy(sceneColors.rim);
+    }
+    if (matC.current) {
+      matC.current.opacity = Math.min(0.4, glow * 0.62);
+      matC.current.color.copy(sceneColors.rim);
+    }
   });
 
   return (
@@ -672,6 +709,7 @@ function Sweep() {
     }
     if (material.current) {
       material.current.opacity = 0.05 + audioLevels.thinking * 0.2 + audioLevels.level * 0.07;
+      material.current.color.copy(sceneColors.ring);
     }
   });
 
@@ -780,8 +818,12 @@ function CameraRig() {
     // A very slow parallax drift keeps the still frame from feeling dead,
     // plus a gentle push-in while speaking.
     const t = state.clock.elapsedTime;
-    const cam = state.camera;
-    const targetZ = 7.0 - audioLevels.level * 0.35 - audioLevels.kick * 0.2;
+    const cam = state.camera as THREE.PerspectiveCamera;
+    // The cortical shell is wider than it is tall, so on a narrow window the
+    // framing has to back off or the outer synapses fall off the sides.
+    const aspect = state.size.width / Math.max(1, state.size.height);
+    const fit = aspect < 1.7 ? 1 + (1.7 - Math.max(0.9, aspect)) * 0.42 : 1;
+    const targetZ = 7.6 * fit - audioLevels.level * 0.35 - audioLevels.kick * 0.2;
     cam.position.x += (Math.sin(t * 0.13) * 0.16 - cam.position.x) * Math.min(1, dt * 0.6);
     cam.position.y += (0.18 + Math.cos(t * 0.11) * 0.12 - cam.position.y) * Math.min(1, dt * 0.6);
     cam.position.z += (targetZ - cam.position.z) * Math.min(1, dt * 2.2);
@@ -798,7 +840,7 @@ export default function Scene() {
       className="scene-canvas"
       dpr={[1, 2]}
       gl={{ antialias: true, alpha: true, powerPreference: "high-performance" }}
-      camera={{ fov: 44, position: [0, 0.18, 7.0], near: 0.1, far: 80 }}
+      camera={{ fov: 44, position: [0, 0.18, 7.6], near: 0.1, far: 80 }}
     >
       <AdaptiveDpr pixelated={false} />
       <CameraRig />
@@ -812,6 +854,7 @@ export default function Scene() {
       <GyroRings />
       <Sweep />
       <Satellites />
+      <NeuralMesh />
     </Canvas>
   );
 }

@@ -11,12 +11,14 @@
 import { useEffect } from "react";
 import { audioEngine, decodePcm16LE } from "@/audio/engine";
 import { audioLevels } from "@/audio/levels";
+import { applyActivation, setGraph } from "@/state/neural";
 import { useJarvis } from "@/state/jarvis";
 import type {
   AssistantStatus,
   AudioServerFrame,
   CommandFrame,
   LogsServerFrame,
+  SettingsCommandFrame,
 } from "@/lib/protocol";
 
 /** Module-level handle so imperative senders (input, STT) reach the socket. */
@@ -28,6 +30,34 @@ export function sendCommand(text: string, origin: "text" | "voice" = "text"): bo
   const frame: CommandFrame = { type: "command", text, origin };
   socket.send(JSON.stringify(frame));
   return true;
+}
+
+/** Push a settings delta over the live socket, falling back to REST. */
+export function sendSettings(delta: Omit<SettingsCommandFrame, "type">): void {
+  const socket = sockets.logs;
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: "settings", ...delta }));
+    return;
+  }
+  void fetch("/api/settings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(delta),
+  }).catch(() => undefined);
+}
+
+/** Invoke a skill by hand — the same path the cortex takes. */
+export function sendSkill(name: string, args: Record<string, unknown> = {}): void {
+  const socket = sockets.logs;
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: "skill", name, arguments: args }));
+    return;
+  }
+  void fetch(`/api/skills/${encodeURIComponent(name)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ arguments: args }),
+  }).catch(() => undefined);
 }
 
 /** Barge-in: cut the assistant off mid-sentence, locally and server-side. */
@@ -102,8 +132,13 @@ export function useJarvisConnection(): void {
               model: frame.engines.model,
             });
             if (frame.operator) s.setOperator(frame.operator);
-            if (frame.settings) s.setSettings(frame.settings);
+            if (frame.settings) {
+              s.setSettings(frame.settings);
+              audioEngine.setVolume(frame.settings.volume ?? 0.9);
+            }
             if (frame.vitals) s.setVitals(frame.vitals);
+            if (frame.skills) s.setSkills(frame.skills);
+            if (frame.memory) s.setMemoryStats(frame.memory);
             break;
           case "log":
             s.pushLog(frame.level, frame.source, frame.msg);
@@ -118,6 +153,34 @@ export function useJarvisConnection(): void {
           case "settings.update":
             s.setSettings(frame.settings);
             s.setEngines({ model: frame.settings.model });
+            // Volume lives in the registry so every client agrees on it, but
+            // it is only ever *applied* here, in the browser's audio graph.
+            audioEngine.setVolume(frame.settings.volume ?? 0.9);
+            break;
+          case "neural.graph":
+            setGraph(frame.nodes, frame.edges);
+            s.setNeuralSize(frame.nodes.length, frame.edges.length);
+            break;
+          case "neural":
+            // Straight into the mutable singleton: at 20 Hz this must not
+            // touch React at all, or the whole WebGL tree re-renders.
+            applyActivation(frame.levels, frame.flows, frame.regions, frame.fired);
+            break;
+          case "metrics":
+            s.setMetrics(frame);
+            break;
+          case "tool":
+            s.pushTool(frame);
+            break;
+          case "reminder":
+          case "reminder.set":
+            s.pushLog(
+              "success",
+              "reminder",
+              frame.type === "reminder.set"
+                ? `scheduled: ${frame.text}`
+                : `due: ${frame.text}`,
+            );
             break;
           case "vitals":
             s.setVitals(frame);

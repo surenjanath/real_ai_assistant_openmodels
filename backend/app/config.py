@@ -42,7 +42,7 @@ class Settings:
 
     # --- Identity / telemetry -------------------------------------------
     name: str = field(default_factory=lambda: _env("NAME", "J.A.R.V.I.S."))
-    version: str = "1.2.0"
+    version: str = "1.3.0"
     operator: str = field(default_factory=lambda: _env("OPERATOR", "sir"))
     log_backlog: int = field(default_factory=lambda: _env_int("LOG_BACKLOG", 60))
     heartbeat_min_s: float = field(default_factory=lambda: _env_int("HEARTBEAT_MIN_S", 6))
@@ -62,6 +62,24 @@ class Settings:
     # assistant. Users opt in per-session from the panel or by voice.
     think: bool = field(default_factory=lambda: _env_bool("THINK", False))
     memory_turns: int = field(default_factory=lambda: _env_int("MEMORY_TURNS", 8))
+    #: personality preset key - see personas.py
+    persona: str = field(default_factory=lambda: _env("PERSONA", "jarvis"))
+    #: let the cortex call skills natively when the model supports it
+    tools: bool = field(default_factory=lambda: _env_bool("TOOLS", True))
+    #: how many tool round-trips one directive may spend
+    tool_rounds: int = field(default_factory=lambda: _env_int("TOOL_ROUNDS", 4))
+
+    # --- Durable memory (Phase 6) -----------------------------------------
+    #: inject relevant fragments of past sessions into the prompt
+    recall: bool = field(default_factory=lambda: _env_bool("RECALL", True))
+    #: how many recalled fragments may be injected per directive
+    recall_limit: int = field(default_factory=lambda: _env_int("RECALL_LIMIT", 4))
+    #: minimum relevance a fragment needs before it is worth the tokens
+    recall_threshold: float = field(default_factory=lambda: _env_float("RECALL_THRESHOLD", 0.18))
+    #: persist every turn to the on-disk hippocampus
+    persist: bool = field(default_factory=lambda: _env_bool("PERSIST", True))
+    #: how often the reminder scheduler wakes, in seconds
+    reminder_interval_s: float = field(default_factory=lambda: _env_float("REMINDER_INTERVAL_S", 20.0))
 
     # --- Vocal engine (Phase 3) ------------------------------------------
     # auto -> try pykokoro, then kokoro, then the dependency-free fallback synth.
@@ -77,6 +95,8 @@ class Settings:
     sample_rate: int = 24000  # Kokoro native output rate; fallback matches it.
     tts_frame_samples: int = field(default_factory=lambda: _env_int("TTS_FRAME_SAMPLES", 4800))  # ~200ms @ 24kHz
     tts_max_chars: int = field(default_factory=lambda: _env_int("TTS_MAX_CHARS", 1800))
+    #: default interface playback gain, 0..1
+    volume: float = field(default_factory=lambda: _env_float("VOLUME", 0.9))
 
     # --- Server ------------------------------------------------------------
     cors_origins: str = field(default_factory=lambda: _env("CORS_ORIGINS", "*"))

@@ -13,6 +13,11 @@ const STATUS_STYLE: Record<AssistantStatus, { label: string; color: string }> = 
   speaking: { label: "TRANSMITTING", color: "#4ade80" },
 };
 
+function personaLabel(settings: { persona: string; personas: Array<{ key: string; label: string }> }): string {
+  const found = settings.personas?.find((p) => p.key === settings.persona);
+  return (found?.label ?? settings.persona ?? "—").toLowerCase();
+}
+
 function uptime(seconds?: number): string {
   if (!seconds) return "";
   const h = Math.floor(seconds / 3600);
@@ -29,6 +34,8 @@ export default function Hud() {
   const audioConnected = useJarvis((s) => s.audioConnected);
   const latency = useJarvis((s) => s.latencyMs);
   const vitals = useJarvis((s) => s.vitals);
+  const memoryStats = useJarvis((s) => s.memoryStats);
+  const skills = useJarvis((s) => s.skills);
 
   const style = STATUS_STYLE[status];
   const voiceReal = engines.ttsMode === "kokoro";
@@ -65,9 +72,39 @@ export default function Hud() {
       </div>
 
       <div className="hud-row hud-meta">
+        <span className="badge" title="Disposition - say “be more concise” or “switch persona to Friday”">
+          persona · {personaLabel(settings)}
+        </span>
+        <span
+          className={`badge ${settings.tools_active ? "good" : ""}`}
+          title={
+            settings.tools_active
+              ? "The cortex calls skills itself when a question needs real data"
+              : settings.tools_supported
+                ? "Skills are disabled in settings"
+                : "This model does not advertise tool calling"
+          }
+        >
+          skills · {settings.tools_active ? `${skills.length} armed` : "off"}
+        </span>
+      </div>
+
+      <div className="hud-row hud-meta">
         <span className={`badge ${settings.model_verified ? "good" : "warnish"}`}>
           model · {engines.model || settings.model || "none"}
         </span>
+        {memoryStats && (
+          <span
+            className={`badge ${settings.recall ? "" : "warnish"}`}
+            title={
+              settings.recall
+                ? `Recalling across ${memoryStats.sessions} past sessions`
+                : "Long-term recall is off - only this conversation is used"
+            }
+          >
+            memory · {settings.recall ? `${memoryStats.turns}` : "off"}
+          </span>
+        )}
       </div>
 
       <div className="hud-row hud-meta dim">

@@ -15,12 +15,15 @@ import { useJarvis } from "@/state/jarvis";
 import { sendCommand, sendStop } from "@/hooks/useJarvisConnection";
 import { useSpeechRecognition } from "@/hooks/useSpeechRecognition";
 
+/** Deliberately chosen to demonstrate the capabilities that are not obvious:
+ *  durable memory, the reflex arc, skills, and the disposition switch. */
 const SUGGESTIONS = [
   "status",
-  "what time is it",
-  "list models",
-  "change voice to af heart",
-  "run a full system diagnostic",
+  "remember that I take my coffee black",
+  "how much memory is this machine using right now",
+  "remind me to stretch in 20 minutes",
+  "be more concise",
+  "performance report",
 ];
 
 export default function Console() {
@@ -178,7 +181,7 @@ export default function Console() {
               ? "establishing uplink…"
               : wakeMode
                 ? 'listening for "Jarvis…"  ·  or type a directive'
-                : "issue a directive   ·   press / to focus"
+                : "issue a directive   ·   press / to focus   ·   ⌘P for commands"
           }
           spellCheck={false}
           autoComplete="off"

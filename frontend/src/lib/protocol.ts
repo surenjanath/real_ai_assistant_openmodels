@@ -21,6 +21,21 @@ export interface TranscriptTurn {
 
 /* ---- /ws/logs ---- */
 
+export interface PersonaInfo {
+  key: string;
+  label: string;
+  blurb: string;
+  temperature: number;
+}
+
+export interface SkillInfo {
+  name: string;
+  description: string;
+  /** safe | reads_files | executes | network */
+  danger: string;
+  params: string[];
+}
+
 export interface SettingsState {
   model: string;
   model_verified: boolean;
@@ -36,6 +51,18 @@ export interface SettingsState {
   /** whether the current model has a thinking mode at all */
   think_supported: boolean;
   think_active: boolean;
+  /** selected personality preset */
+  persona: string;
+  personas: PersonaInfo[];
+  /** whether the cortex may call skills natively */
+  tools: boolean;
+  /** whether the current model advertises tool calling at all */
+  tools_supported: boolean;
+  tools_active: boolean;
+  /** durable cross-session recall */
+  recall: boolean;
+  /** playback gain 0..1 */
+  volume: number;
 }
 
 export interface Vitals {
@@ -65,6 +92,18 @@ export interface EngineInfo {
   model: string;
 }
 
+export interface MemoryStats {
+  turns: number;
+  sessions: number;
+  facts: number;
+  notes: number;
+  reminders: number;
+  since: number | null;
+  path: string;
+  fts: boolean;
+  size_kb: number;
+}
+
 export interface HelloFrame {
   type: "hello";
   name: string;
@@ -73,6 +112,107 @@ export interface HelloFrame {
   engines: EngineInfo;
   settings?: SettingsState;
   vitals?: Vitals;
+  skills?: SkillInfo[];
+  memory?: MemoryStats | null;
+}
+
+/* ---- the cognitive graph (backend/app/neural.py) ---- */
+
+export interface NeuralNodeFrame {
+  id: string;
+  label: string;
+  /** sensory | intake | memory | cortex | effector | motor */
+  region: string;
+  layer: number;
+  /** core | tool */
+  kind: string;
+}
+
+export interface NeuralEdgeFrame {
+  id: string;
+  from: string;
+  to: string;
+  weight: number;
+}
+
+/** Sent once per client, and again whenever a tool node is grown. */
+export interface NeuralGraphFrame {
+  type: "neural.graph";
+  nodes: NeuralNodeFrame[];
+  edges: NeuralEdgeFrame[];
+  levels?: number[];
+  fired?: number;
+}
+
+/** Coalesced activation, ~20 Hz while anything is firing. */
+export interface NeuralFrame {
+  type: "neural";
+  ts: number;
+  /** [nodeIndex, intensity] pairs that spiked since the last frame */
+  spikes: Array<[number, number]>;
+  /** [edgeIndex, intensity] pairs that carried a signal */
+  flows: Array<[number, number]>;
+  /** decayed activation per node, index-aligned with the graph */
+  levels: number[];
+  regions: Record<string, number>;
+  fired: number;
+}
+
+/* ---- instrumentation ---- */
+
+export interface MetricsBand {
+  p50: number;
+  p95: number;
+  last: number;
+}
+
+export interface MetricsRun {
+  text: string;
+  origin: string;
+  model: string;
+  mode: string;
+  kind: string;
+  ttft_ms: number;
+  total_ms: number;
+  voice_ms: number | null;
+  tok_s: number;
+  chars: number;
+  tool_calls: number;
+  tools_used: string[];
+  error: string;
+}
+
+export interface MetricsFrame {
+  type: "metrics";
+  ts: number;
+  commands: number;
+  errors: number;
+  tool_calls: number;
+  spoken_chars: number;
+  uptime_s: number;
+  ttft_ms: MetricsBand;
+  total_ms: MetricsBand;
+  tok_s: { avg: number; best: number; last: number };
+  last: MetricsRun | null;
+  history: Array<{ ttft_ms: number; total_ms: number; tok_s: number; kind: string; error: boolean }>;
+}
+
+/** One executed skill, as it happens. */
+export interface ToolFrame {
+  type: "tool";
+  name: string;
+  args: Record<string, unknown>;
+  ok: boolean;
+  detail: string;
+  elapsed_ms: number;
+  ts: number;
+}
+
+export interface ReminderFrame {
+  type: "reminder" | "reminder.set";
+  id: number;
+  text: string;
+  due_ts: number;
 }
 
 export interface LogFrame {
@@ -134,12 +274,37 @@ export type LogsServerFrame =
   | AnswerFrame
   | TranscriptFrame
   | UiFrame
+  | NeuralGraphFrame
+  | NeuralFrame
+  | MetricsFrame
+  | ToolFrame
+  | ReminderFrame
   | { type: "pong"; ts?: number };
 
 export interface CommandFrame {
   type: "command" | "speak" | "stop";
   text?: string;
   origin?: "text" | "voice";
+}
+
+/** Settings delta pushed over the telemetry socket (same shape as POST /api/settings). */
+export interface SettingsCommandFrame {
+  type: "settings";
+  model?: string;
+  voice?: string;
+  speed?: number;
+  think?: boolean;
+  persona?: string;
+  tools?: boolean;
+  recall?: boolean;
+  volume?: number;
+}
+
+/** Invoke a skill by hand from the interface. */
+export interface SkillCommandFrame {
+  type: "skill";
+  name: string;
+  arguments?: Record<string, unknown>;
 }
 
 /* ---- /ws/audio ---- */

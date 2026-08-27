@@ -3,14 +3,19 @@
 /** Client root: composes the holographic scene and HUD layers. */
 
 import dynamic from "next/dynamic";
+import { useEffect } from "react";
+import CommandPalette from "./CommandPalette";
 import Console from "./Console";
+import CortexPanel from "./CortexPanel";
 import Hud from "./Hud";
+import Instruments from "./Instruments";
 import MathAnchor from "./MathAnchor";
+import Overlays from "./Overlays";
 import SettingsPanel from "./SettingsPanel";
 import TelemetryPanel from "./TelemetryPanel";
 import VitalsPanel from "./VitalsPanel";
 import { useJarvisConnection } from "@/hooks/useJarvisConnection";
-import { useJarvis } from "@/state/jarvis";
+import { THEMES, useJarvis, type Theme } from "@/state/jarvis";
 
 const Scene = dynamic(() => import("./Scene"), { ssr: false });
 
@@ -19,6 +24,22 @@ export default function JarvisApp() {
   const status = useJarvis((s) => s.status);
   const logsConnected = useJarvis((s) => s.logsConnected);
   const wakeWordOn = useJarvis((s) => s.wakeWordOn);
+  const setTheme = useJarvis((s) => s.setTheme);
+
+  /* Restore the saved colour scheme. Done here rather than in the store's
+     initialiser because the server render has no localStorage, and reading it
+     during hydration would mismatch. */
+  useEffect(() => {
+    let saved: string | null = null;
+    try {
+      saved = window.localStorage.getItem("jarvis.theme");
+    } catch {
+      // Storage blocked; the default scheme is perfectly usable.
+    }
+    if (saved && (THEMES as readonly string[]).includes(saved)) {
+      setTheme(saved as Theme);
+    }
+  }, [setTheme]);
 
   return (
     <main className={`app ${status !== "boot" ? "ready" : ""}`} data-status={status}>
@@ -39,10 +60,19 @@ export default function JarvisApp() {
       {wakeWordOn && <div className="wake-ring" aria-hidden="true" />}
 
       <Hud />
-      <VitalsPanel />
+      <Instruments />
+
+      {/* One rail, so the cortex map and the vitals can never overlap however
+          tall the window is — the cortex simply takes what is left over. */}
+      <div className="left-rail">
+        <CortexPanel />
+        <VitalsPanel />
+      </div>
       <TelemetryPanel />
       <Console />
       <SettingsPanel />
+      <Overlays />
+      <CommandPalette />
       <MathAnchor />
 
       <div className={`boot-veil ${logsConnected ? "gone" : ""}`}>
