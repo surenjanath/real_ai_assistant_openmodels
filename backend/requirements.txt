@@ -1,4 +1,14 @@
-# J.A.R.V.I.S. backend - core runtime (thin, runs anywhere)
+# J.A.R.V.I.S. backend - core runtime.
+#
+# IMPORTANT: use Python 3.12. The Kokoro voice stack has no wheels for 3.13+
+# (`kokoro` requires <3.13, `kokoro-onnx` requires <3.14), so a 3.13/3.14 venv
+# silently falls back to the robotic synth. `make setup` pins this for you.
 fastapi>=0.110
 uvicorn[standard]>=0.29
 numpy>=1.26
+psutil>=5.9
+
+# --- Phase 3: Kokoro-82M natural speech -------------------------------------
+# pykokoro is the ONNX re-implementation - no torch, and its `provider` can
+# target Core ML (Apple Neural Engine) so Metal stays free for Ollama.
+pykokoro[coreml]>=0.8

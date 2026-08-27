@@ -16,15 +16,22 @@ export interface AudioLevels {
   mid: number;
   /** high-frequency energy 0..1 - drives glow / point brightness */
   treble: number;
-  /** 24 log-spaced spectrum bands 0..1 - drives the ring visualizer */
+  /** 64 log-spaced spectrum bands 0..1 - drives the ring visualizer */
   bands: Float32Array;
+  /** 128-point time-domain waveform, -1..1 - drives the oscilloscope ring */
+  wave: Float32Array;
   /** transient kick 0..1, spikes at utterance start, decays exponentially */
   kick: number;
   /** true while scheduled audio is still playing */
   speaking: boolean;
+  /** true while the mic is capturing */
+  listening: boolean;
+  /** 0..1 ramp toward the "thinking" visual state */
+  thinking: number;
 }
 
-export const BAND_COUNT = 24;
+export const BAND_COUNT = 64;
+export const WAVE_COUNT = 128;
 
 export const audioLevels: AudioLevels = {
   level: 0,
@@ -32,6 +39,9 @@ export const audioLevels: AudioLevels = {
   mid: 0,
   treble: 0,
   bands: new Float32Array(BAND_COUNT),
+  wave: new Float32Array(WAVE_COUNT),
   kick: 0,
   speaking: false,
+  listening: false,
+  thinking: 0,
 };

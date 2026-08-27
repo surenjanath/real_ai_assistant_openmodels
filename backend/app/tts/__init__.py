@@ -25,5 +25,10 @@ def build_engine(bus: LogBus) -> tuple[TTSEngine, str]:
             if choice != "auto":
                 bus.publish("error", "tts", f"forced engine '{choice}' unavailable - falling back")
 
-    bus.publish("info", "tts", "using dependency-free fallback-synth (install kokoro for natural speech)")
+    bus.publish(
+        "warn",
+        "tts",
+        "using dependency-free fallback-synth - run `make setup` on python 3.12 "
+        "and `pip install 'pykokoro[coreml]'` for the real Kokoro voice",
+    )
     return FallbackEngine(), "fallback"

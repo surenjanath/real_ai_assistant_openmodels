@@ -2,17 +2,16 @@
 
 /**
  * Telemetry panel (PRD §2): floating semi-transparent terminal anchored to
- * the right edge. Monospace, max-width 350px, auto-scrolling, color-coded:
+ * the right edge. Monospace, auto-scrolling, color-coded:
  *   gray = processing · blue = STT/TTS · green = workflow success
  * (plus amber warnings / red errors for completeness).
  *
- * Includes the command bar (typed + voice) that drives the agent pipeline.
+ * Two tabs: the raw operational log, and the conversation transcript.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useJarvis } from "@/state/jarvis";
-import { sendCommand } from "@/hooks/useJarvisConnection";
-import { useSpeechRecognition } from "@/hooks/useSpeechRecognition";
+import type { LogLevel } from "@/lib/protocol";
 
 const LEVEL_CLASS: Record<string, string> = {
   info: "log-info",
@@ -21,6 +20,8 @@ const LEVEL_CLASS: Record<string, string> = {
   warn: "log-warn",
   error: "log-error",
 };
+
+type Filter = "all" | "voice" | "agent" | "issues";
 
 function clock(ts: number): string {
   const d = new Date(ts);
@@ -31,31 +32,27 @@ function clock(ts: number): string {
 
 export default function TelemetryPanel() {
   const logs = useJarvis((s) => s.logs);
-  const status = useJarvis((s) => s.status);
+  const transcript = useJarvis((s) => s.transcript);
   const connected = useJarvis((s) => s.logsConnected);
-  const pushLog = useJarvis((s) => s.pushLog);
-  const setStatus = useJarvis((s) => s.setStatus);
+  const clearLogs = useJarvis((s) => s.clearLogs);
 
-  const [command, setCommand] = useState("");
+  const [tab, setTab] = useState<"log" | "chat">("log");
+  const [filter, setFilter] = useState<Filter>("all");
   const scrollRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
 
-  const { listening, supported: micSupported, toggle: toggleMic } = useSpeechRecognition({
-    onTranscript: (text) => {
-      pushLog("voice", "stt", `"${text}"`);
-      setStatus("thinking");
-      if (!sendCommand(text, "voice")) {
-        pushLog("error", "client", "uplink unavailable - command dropped");
-      }
-    },
-    onError: (message) => pushLog("error", "stt", message),
-  });
+  const visible = useMemo(() => {
+    if (filter === "all") return logs;
+    if (filter === "voice") return logs.filter((l) => l.level === "voice" || l.source === "tts" || l.source === "stt");
+    if (filter === "agent") return logs.filter((l) => l.source.startsWith("agent") || l.source === "crew" || l.source === "brain");
+    return logs.filter((l) => l.level === "warn" || l.level === "error");
+  }, [logs, filter]);
 
   useEffect(() => {
     if (stick.current && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [logs]);
+  }, [visible, transcript, tab]);
 
   const onScroll = () => {
     const el = scrollRef.current;
@@ -63,22 +60,31 @@ export default function TelemetryPanel() {
     stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
   };
 
-  const submit = () => {
-    const text = command.trim();
-    if (!text) return;
-    setCommand("");
-    stick.current = true;
-    pushLog(listening ? "voice" : "info", listening ? "stt" : "you", `"${text}"`);
-    setStatus("thinking");
-    if (!sendCommand(text, listening ? "voice" : "text")) {
-      pushLog("error", "client", "uplink unavailable - command dropped");
-    }
-  };
+  const counts = useMemo(() => {
+    let issues = 0;
+    for (const l of logs) if (l.level === "warn" || l.level === "error") issues++;
+    return { issues };
+  }, [logs]);
 
   return (
     <section className="telemetry" data-connected={connected}>
       <header className="telemetry-header">
-        <span className="telemetry-title">OPERATIONAL TELEMETRY</span>
+        <span className="telemetry-tabs">
+          <button
+            type="button"
+            className={`tab ${tab === "log" ? "on" : ""}`}
+            onClick={() => setTab("log")}
+          >
+            TELEMETRY
+          </button>
+          <button
+            type="button"
+            className={`tab ${tab === "chat" ? "on" : ""}`}
+            onClick={() => setTab("chat")}
+          >
+            TRANSCRIPT{transcript.length ? ` (${transcript.length})` : ""}
+          </button>
+        </span>
         <span className="telemetry-header-actions">
           <button
             className="gear"
@@ -95,42 +101,49 @@ export default function TelemetryPanel() {
         </span>
       </header>
 
-      <div className="telemetry-scroll" ref={scrollRef} onScroll={onScroll}>
-        {logs.map((line) => (
-          <div className={`log-line ${LEVEL_CLASS[line.level] ?? "log-info"}`} key={line.id}>
-            <span className="log-ts">{clock(line.ts)}</span>
-            <span className="log-source">{line.source}</span>
-            <span className="log-msg">{line.msg}</span>
-          </div>
-        ))}
-        {logs.length === 0 && <div className="log-line log-info">awaiting uplink…</div>}
-      </div>
-
-      <footer className="telemetry-input">
-        <span className="telemetry-prompt">❯</span>
-        <input
-          value={command}
-          onChange={(event) => setCommand(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") submit();
-          }}
-          placeholder={status === "boot" ? "establishing uplink…" : "issue a directive"}
-          spellCheck={false}
-          autoComplete="off"
-          aria-label="Command input"
-        />
-        {micSupported && (
-          <button
-            className={`mic ${listening ? "active" : ""}`}
-            onClick={toggleMic}
-            title={listening ? "Stop listening" : "Voice command"}
-            aria-label="Toggle voice command"
-            type="button"
-          >
-            {listening ? "◉" : "◎"}
+      {tab === "log" && (
+        <div className="telemetry-filters">
+          {(["all", "voice", "agent", "issues"] as Filter[]).map((f) => (
+            <button
+              key={f}
+              type="button"
+              className={`filter ${filter === f ? "on" : ""} ${f === "issues" && counts.issues ? "has-issues" : ""}`}
+              onClick={() => setFilter(f)}
+            >
+              {f}
+              {f === "issues" && counts.issues ? ` ${counts.issues}` : ""}
+            </button>
+          ))}
+          <button type="button" className="filter ghost" onClick={clearLogs} title="Clear log">
+            clear
           </button>
+        </div>
+      )}
+
+      <div className="telemetry-scroll" ref={scrollRef} onScroll={onScroll}>
+        {tab === "log" ? (
+          <>
+            {visible.map((line) => (
+              <div className={`log-line ${LEVEL_CLASS[line.level] ?? "log-info"}`} key={line.id}>
+                <span className="log-ts">{clock(line.ts)}</span>
+                <span className="log-source">{line.source}</span>
+                <span className="log-msg">{line.msg}</span>
+              </div>
+            ))}
+            {visible.length === 0 && <div className="log-line log-info">no matching lines…</div>}
+          </>
+        ) : (
+          <>
+            {transcript.map((turn) => (
+              <div className={`turn turn-${turn.role}`} key={turn.id}>
+                <span className="turn-who">{turn.role === "user" ? "YOU" : "J.A.R.V.I.S."}</span>
+                <span className="turn-text">{turn.text}</span>
+              </div>
+            ))}
+            {transcript.length === 0 && <div className="log-line log-info">no exchanges yet…</div>}
+          </>
         )}
-      </footer>
+      </div>
     </section>
   );
 }

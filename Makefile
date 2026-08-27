@@ -11,10 +11,44 @@ SHELL := /usr/bin/env bash
 BACKEND_DIR := backend
 FRONTEND_DIR := frontend
 
-.PHONY: setup backend frontend smoke mcp n8n typecheck build
+# The Kokoro voice stack has no wheels for Python 3.13+ (`kokoro` requires
+# <3.13, `kokoro-onnx` <3.14), so a newer interpreter silently degrades the
+# assistant to the robotic fallback synth. Pin 3.12 explicitly.
+PY_VERSION := 3.12
 
-setup:
-	cd $(BACKEND_DIR) && python3 -m venv .venv && .venv/bin/pip install -U pip && .venv/bin/pip install -r requirements.txt
+.PHONY: setup setup-backend setup-frontend backend frontend smoke mcp n8n typecheck build clean-venv
+
+setup: setup-backend setup-frontend
+
+setup-backend:
+	@set -euo pipefail; cd $(BACKEND_DIR); \
+	if command -v uv >/dev/null 2>&1; then \
+	  echo "==> uv: creating python $(PY_VERSION) venv"; \
+	  uv venv --python $(PY_VERSION) .venv; \
+	  uv pip install --python ./.venv/bin/python -r requirements.txt; \
+	else \
+	  PY=$$(command -v python$(PY_VERSION) || true); \
+	  if [ -z "$$PY" ]; then \
+	    echo "ERROR: python$(PY_VERSION) not found and uv is not installed."; \
+	    echo "       The Kokoro voice needs Python $(PY_VERSION); newer versions have no wheels."; \
+	    echo "       Install uv (https://astral.sh/uv) or 'brew install python@$(PY_VERSION)'."; \
+	    exit 1; \
+	  fi; \
+	  echo "==> $$PY: creating venv"; \
+	  "$$PY" -m venv .venv; \
+	  ./.venv/bin/pip install -U pip; \
+	  ./.venv/bin/pip install -r requirements.txt; \
+	fi; \
+	./.venv/bin/python -c "import sys; v=sys.version_info; \
+	  print(f'backend python {v.major}.{v.minor}.{v.micro}'); \
+	  sys.exit(0 if v[:2]==(3,12) else 1)" \
+	  || { echo 'ERROR: backend venv is not python $(PY_VERSION)'; exit 1; }
+	@echo "==> verifying the Kokoro voice engine imports"
+	@cd $(BACKEND_DIR) && ./.venv/bin/python -c "\
+import pykokoro, sys; print('pykokoro', pykokoro.__version__, 'OK')" \
+	  || echo "WARNING: pykokoro unavailable - the assistant will use the fallback synth"
+
+setup-frontend:
 	cd $(FRONTEND_DIR) && npm install
 
 backend:
@@ -37,3 +71,6 @@ typecheck:
 
 build:
 	cd $(FRONTEND_DIR) && npm run build
+
+clean-venv:
+	rm -rf $(BACKEND_DIR)/.venv
