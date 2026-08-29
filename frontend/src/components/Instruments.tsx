@@ -75,6 +75,20 @@ export default function Instruments() {
         </span>
       </span>
       <span className="instr-sep" />
+      {/* The usual explanation for a slow first word. The model re-reads the
+          entire prompt before returning a single token, so this number *is*
+          the wait — and with tool schemas attached it starts near 3,000
+          before a word has been said. */}
+      <span
+        className="instr"
+        title="Prompt tokens read before the last answer began — clear the context (⌘P) if this is climbing"
+      >
+        <span className="instr-label">CONTEXT</span>
+        <span className="instr-value">
+          {last?.prompt_tokens ? `${(last.prompt_tokens / 1000).toFixed(1)}k` : "—"}
+        </span>
+      </span>
+      <span className="instr-sep" />
       <span className="instr">
         <span className="instr-label">TOK/S</span>
         <span className="instr-value">{metrics?.tok_s.last ? metrics.tok_s.last.toFixed(0) : "—"}</span>

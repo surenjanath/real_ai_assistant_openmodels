@@ -249,10 +249,92 @@ button {
   justify-content: space-between;
   gap: 12px;
   pointer-events: none;
+  /* The rail carries a third card now, and on a shorter laptop screen the
+     three of them can want more room than the rail has. Scrolling is the one
+     degradation that never hides a control: clipping would silently cut the
+     bottom off the ACCESS card, and shrinking the gauges makes them unreadable.
+     The bar only appears when it is genuinely needed. */
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.left-rail::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
 .left-rail > * {
   pointer-events: auto;
+}
+
+/* Vitals and the panel launcher travel together at the foot of the rail;
+   without this the rail's space-between would strand one in the middle. */
+.rail-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+/* ---------- access card ---------- */
+
+.access {
+  flex: none;
+  width: 100%;
+  padding: 12px 14px 13px;
+  border: 1px solid var(--glass-line);
+  border-radius: 10px;
+  background: var(--glass);
+  backdrop-filter: blur(12px);
+  font-family: var(--mono);
+}
+
+.access-title {
+  font-size: 9px;
+  letter-spacing: 0.28em;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+
+.access-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+
+.access-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  padding: 8px 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  transition: color 180ms ease, border-color 180ms ease, background 180ms ease;
+}
+
+.access-btn:hover,
+.access-btn:focus-visible {
+  color: var(--cyan);
+  border-color: rgba(143, 214, 255, 0.4);
+  background: rgba(143, 214, 255, 0.06);
+}
+
+.access-glyph {
+  font-size: 14px;
+  line-height: 1;
+}
+
+/* The labels are the point of the card, so they are allowed to be small but
+   never cramped: three of them share 204px, and "REFERENCE" is the longest. */
+.access-label {
+  font-size: 7.5px;
+  letter-spacing: 0.12em;
+  white-space: nowrap;
 }
 
 .vitals {
@@ -441,20 +523,6 @@ button {
   gap: 8px;
 }
 
-.gear {
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: transparent;
-  color: var(--dim);
-  font-size: 12px;
-  line-height: 1;
-  padding: 3px 6px;
-  transition: color 180ms ease, border-color 180ms ease;
-}
-.gear:hover {
-  color: var(--cyan);
-  border-color: rgba(143, 214, 255, 0.4);
-}
 
 .telemetry-link {
   font-size: 9px;
@@ -1044,9 +1112,17 @@ button {
 /* ---------- responsive ---------- */
 
 @media (max-width: 1180px) {
+  /* Archive, reference and settings live in the rail now, so hiding it costs
+     their buttons. All three stay reachable from the command palette (⌘P),
+     and the reference card from `?`. */
   .left-rail { display: none; }
   .telemetry { width: 320px; }
 }
+
+/* No short-viewport inset tweak here on purpose. `top: 216px` is the clearance
+   for the identity cluster above (`.hud`, top: 30px, same column) - raising it
+   to buy room for the third card put the cortex straight through the wordmark.
+   A rail that is short of room scrolls; it never moves into its neighbours. */
 
 @media (max-width: 860px) {
   .telemetry {
@@ -1759,6 +1835,9 @@ html[data-theme="mono"] {
 .skill[data-danger="executes"] { border-left-color: var(--red); }
 .skill[data-danger="network"] { border-left-color: var(--amber); }
 .skill[data-danger="reads_files"] { border-left-color: var(--cyan); }
+/* A write is a real side effect even when it is confined to the scratch
+   folder, so it gets its own colour rather than reading as "safe". */
+.skill[data-danger="writes_files"] { border-left-color: var(--green); }
 
 .skill-head {
   display: flex;
@@ -1820,6 +1899,7 @@ html[data-theme="mono"] {
 }
 
 .persona {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -1830,6 +1910,154 @@ html[data-theme="mono"] {
   color: var(--dim);
   font-family: var(--mono);
   text-align: left;
+}
+
+/* Selecting the disposition. Fills the card so the whole thing stays a target,
+   with the pencil sitting above it in the corner. */
+.persona-pick {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 0;
+  padding-right: 16px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.persona-edit {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  padding: 2px 5px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: none;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 160ms ease, color 160ms ease, border-color 160ms ease;
+}
+
+/* Revealed on approach rather than always on: seven pencils competing with
+   seven names is noise, and the cards are read far more often than edited. */
+.persona:hover .persona-edit,
+.persona:focus-within .persona-edit {
+  opacity: 1;
+}
+
+.persona-edit:hover,
+.persona-edit:focus-visible {
+  color: var(--cyan);
+  border-color: rgba(143, 214, 255, 0.4);
+  opacity: 1;
+}
+
+.persona-new {
+  align-items: flex-start;
+  border-style: dashed;
+  cursor: pointer;
+}
+
+.persona-new:hover {
+  color: var(--cyan);
+  border-color: rgba(143, 214, 255, 0.4);
+}
+
+/* ---------- disposition editor ---------- */
+
+.persona-editor {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--glass-line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.persona-editor-head {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.persona-editor-head b {
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--ink);
+}
+
+.persona-editor-head em {
+  font-size: 9px;
+  font-style: normal;
+  color: var(--muted);
+}
+
+.persona-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.persona-row > span {
+  font-size: 8.5px;
+  letter-spacing: 0.18em;
+  color: var(--muted);
+}
+
+.persona-row input[type="text"],
+.persona-row input:not([type]),
+.persona-row select,
+.persona-row textarea {
+  width: 100%;
+  padding: 7px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.25);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.persona-row textarea {
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.persona-row input:focus,
+.persona-row select:focus,
+.persona-row textarea:focus {
+  outline: none;
+  border-color: rgba(143, 214, 255, 0.45);
+}
+
+.persona-error {
+  padding: 6px 8px;
+  border: 1px solid rgba(255, 107, 107, 0.4);
+  border-radius: 6px;
+  color: var(--red);
+  font-size: 10px;
+}
+
+.persona-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.settings-btn.danger {
+  color: var(--red);
+  border-color: rgba(255, 107, 107, 0.35);
+}
+
+.settings-btn.danger:hover {
+  border-color: rgba(255, 107, 107, 0.6);
 }
 
 .persona b {
@@ -1843,6 +2071,16 @@ html[data-theme="mono"] {
   font-style: normal;
   color: var(--muted);
   line-height: 1.45;
+}
+
+.persona-voice {
+  display: block;
+  margin-top: 4px;
+  font-style: normal;
+  font-size: 8px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
 }
 
 .persona:hover { border-color: var(--accent-glow); }

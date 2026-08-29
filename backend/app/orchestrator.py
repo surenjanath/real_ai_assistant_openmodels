@@ -32,11 +32,12 @@ from .agents.base import Runtime
 from .agents.ollama_runtime import OllamaRuntime
 from .agents.simulated_runtime import SimulatedRuntime
 from .config import settings
+from .echoguard import is_echo
 from .intents import Intent, parse_intent
 from .logbus import LogBus
 from .memory import Memory
 from .metrics import Metrics, Run
-from .personas import PERSONALITIES, resolve as resolve_persona
+from .personas import PERSONALITIES, find as find_persona, resolve as resolve_persona
 from .registry import Registry, voice_label
 from .skills import SkillKit, parse_when
 from .tts.manager import TTSManager
@@ -112,12 +113,14 @@ class Orchestrator:
             runtime.on_delta = self._emit_delta
             runtime.on_reset = self._emit_reset
             runtime.on_tool = self._emit_tool
+            runtime.on_usage = self._emit_usage
             runtime.vitals_provider = self.vitals_provider
             if self.memory is not None:
                 runtime.context_provider = self._recall_context
             # Warm the weights now and whenever the operator switches model,
             # so no directive ever pays the page-in cost.
             self.registry.on_model_change = self._on_model_change
+            self.registry.on_persona_change = self._on_persona_change
             if settings.preload:
                 asyncio.create_task(runtime.preload(), name="preload")
         self.runtime = runtime
@@ -125,6 +128,21 @@ class Orchestrator:
         self._watchdog = asyncio.create_task(self._supervise(), name="orchestrator-watchdog")
         if self.memory is not None:
             self._reminders = asyncio.create_task(self._reminder_loop(), name="reminders")
+
+    def _on_persona_change(self, key: str) -> None:
+        """A new disposition speaks in its own voice, not the last one's."""
+        runtime = self.runtime
+        shed = getattr(runtime, "shed_style", None)
+        if shed is None:
+            return
+        with contextlib.suppress(Exception):
+            dropped = shed()
+            if dropped:
+                self.bus.publish(
+                    "info", "settings",
+                    f"disposition changed to {key} - {dropped} reply(s) in the previous "
+                    "voice released so it is not imitated",
+                )
 
     def _on_model_change(self, tag: str) -> None:
         """Page the newly selected model in, off the critical path."""
@@ -152,8 +170,61 @@ class Orchestrator:
     def mode(self) -> str:
         return getattr(self.runtime, "mode", "simulated")
 
-    async def enqueue_nowait(self, text: str, origin: str = "text") -> bool:
-        """Queue a directive without blocking; False when the queue is full."""
+    def echoed_self(self, text: str) -> bool:
+        """Did the microphone just hear J.A.R.V.I.S. rather than the operator?
+
+        The interface guards this too, using acoustics it can measure and we
+        cannot. This is the second line: whatever the timing said, a transcript
+        made almost entirely of words we spoke seconds ago is our own voice
+        coming back in, and answering it starts a conversation with ourselves.
+        """
+        recent = self.tts.recent_speech(settings.echo_guard_ms / 1000.0)
+        if not recent:
+            return False
+        return is_echo(text, recent, threshold=settings.echo_similarity)
+
+    async def enqueue_nowait(self, text: str, origin: str = "text", *,
+                             verified: bool = False) -> bool:
+        """Queue a directive without blocking; False when the queue is full.
+
+        `verified` is a client saying it has acoustic grounds to believe a
+        person spoke - it ran the transcript past an echo-cancelled capture
+        stream. Content alone cannot distinguish the operator repeating a
+        suggestion back ("open the settings panel") from the assistant being
+        overheard saying it, so a client that *can* tell gets to say so.
+        Clients with no microphone of their own - the n8n and MCP bridges -
+        never set it, and are checked.
+        """
+        if origin == "voice":
+            if not verified and self.echoed_self(text):
+                self.bus.publish("info", "stt", f'echo suppressed - "{text[:60]}"')
+                return False
+            # Barge-in on arrival, not on dequeue. The worker drains this queue
+            # one directive at a time and a directive is not finished until its
+            # answer has finished *playing*, so without this the operator's
+            # follow-up waits out the entire answer they just interrupted.
+            #
+            # Both halves matter. Stopping only the voice leaves the model
+            # writing the rest of an answer nobody will hear, and the new
+            # directive still waits for it; aborting only the model leaves the
+            # already-synthesised audio talking over the operator.
+            #
+            # Interrupting *speech* is always the operator's intent - they can
+            # hear perfectly well that they are talking over the answer. While
+            # the assistant is merely composing there is nothing to talk over,
+            # so a stray "mm" picked up by an open microphone must not throw
+            # away a reply that was seconds from being delivered: only a real
+            # phrase, or an explicit stop, gets to do that.
+            spoken_over = self.tts.speaking
+            composing = self._lock.locked()
+            intent = parse_intent(text)
+            deliberate = (
+                len(text.split()) >= 2 or (intent is not None and intent.kind == "stop")
+            )
+            if settings.barge_in and (spoken_over or (composing and deliberate)):
+                self.bus.publish("voice", "stt", "operator spoke - cutting the answer short")
+                self._interrupt()
+
         try:
             self._queue.put_nowait((text, origin))
         except asyncio.QueueFull:
@@ -230,23 +301,35 @@ class Orchestrator:
                 lines.extend(f"- {f['key']}: {f['value']}" for f in facts)
 
             exclude = (self._live_turn_id,) if self._live_turn_id else ()
+            # Operator turns only, and this is the important part.
+            #
+            # An answer of yours is not evidence of anything - it is an
+            # unverified generation. Injecting one as context is how a single
+            # wrong answer becomes permanent: asked for a hash it could not
+            # compute, the model invented one; the invention was persisted;
+            # recall then served it back on every later asking as though it
+            # were established, and the model stopped calling the tool that
+            # would have got it right. A prose caveat did not stop that - only
+            # not putting it there does.
+            #
+            # Nothing is lost: the `recall` *skill* still searches every turn
+            # including its own, so "what did you tell me earlier" works. The
+            # difference is that it is asked for, rather than fed in.
             hits = [
                 h for h in self.memory.search(text, limit=settings.recall_limit,
-                                              exclude_ids=exclude)
+                                              exclude_ids=exclude, roles=("user",))
                 if h.score >= settings.recall_threshold
             ]
             if hits:
-                lines.append("Relevant fragments of earlier conversations:")
+                lines.append("Things the operator has said before:")
                 for hit in hits:
-                    who = "operator" if hit.role == "user" else "you"
-                    lines.append(f"- ({_ago(hit.ts)}) {who}: {hit.text[:280]}")
+                    lines.append(f"- ({_ago(hit.ts)}) operator: {hit.text[:280]}")
             if not lines:
                 return ""
             lines.append(
-                "These are a record of what was said, not a source of truth: an earlier answer "
-                "of yours may have been wrong. Use them only when actually relevant, never "
-                "recite them unprompted, and prefer a tool call over repeating a remembered "
-                "figure."
+                "This is a record of what the operator said, not a source of truth about the "
+                "world. Use it only when actually relevant, never recite it unprompted, and "
+                "always prefer a tool call over repeating a remembered figure."
             )
             return "\n".join(lines)
         except Exception as exc:  # noqa: BLE001 - recall must never break a turn
@@ -310,6 +393,22 @@ class Orchestrator:
             "ts": time.time(),
         })
 
+    def _emit_usage(self, prompt_tokens: int, eval_tokens: int) -> None:
+        """Record what the prompt actually cost.
+
+        A slow first word is almost always a large prompt rather than a slow
+        model - the whole thing is re-read before a single token comes back -
+        so this is the figure that explains the wait, and the interface shows
+        it next to the wait itself.
+        """
+        run = self._run
+        if run is None:
+            return
+        # A tool round means two evaluations for one directive; the operator
+        # waited for both, so report the total rather than the last.
+        run.prompt_tokens += prompt_tokens
+        run.eval_tokens += eval_tokens
+
     def _emit_answer(self, text: str) -> None:
         self.bus.push_frame({"type": "answer", "text": text})
 
@@ -359,7 +458,12 @@ class Orchestrator:
             source = "stt" if origin == "voice" else "you"
             self.bus.publish("voice" if origin == "voice" else "info", source, f'"{text}"')
             self.bus.push_frame({"type": "transcript", "role": "user", "text": text})
-            self._live_turn_id = self._persist("user", text, origin=origin)
+            # Off-loop: this is a synchronous SQLite write (plus an fts index
+            # update) sitting between the operator finishing their sentence and
+            # the model being asked anything at all.
+            self._live_turn_id = await asyncio.to_thread(
+                self._persist, "user", text, origin=origin
+            )
 
             if intent is not None:
                 self._fire("intake.intent", "intake.control")
@@ -412,6 +516,24 @@ class Orchestrator:
                 return
             finally:
                 self._voice = None
+
+            if not answer.strip():
+                # The operator interrupted, and the directive they interrupted
+                # with is already in the queue behind this one. Saying anything
+                # here - even "I could not compose a response" - would talk
+                # over the thing they actually asked for.
+                self.bus.publish("info", "workflow", "directive abandoned - operator interrupted")
+                # Usually the barge-in already tore this down; close it anyway
+                # so an abandoned stream cannot sit waiting on a queue that
+                # will never be fed again.
+                if voice is not None and not voice.stopped:
+                    await voice.cancel()
+                if run is not None and self.metrics is not None:
+                    run.error = run.error or "interrupted"
+                    self.metrics.finish(run)
+                    self._run = None
+                self._broadcast_status("idle")
+                return
 
             elapsed = time.monotonic() - started
             if run is not None:
@@ -479,7 +601,24 @@ class Orchestrator:
 
     # ------------------------------------------------------------------ intents
 
+    def _interrupt(self) -> None:
+        """Drop everything in flight: stop talking, and stop composing.
+
+        Safe to call from anywhere on the loop - the actual stop is detached so
+        it never blocks the socket receive loop, which is where barge-in
+        arrives from.
+        """
+        runtime = self.runtime
+        if runtime is not None:
+            with contextlib.suppress(Exception):
+                runtime.abort()
+        asyncio.create_task(self.tts.stop(reason="barge-in"), name="barge-in")
+
     async def _handle_stop(self) -> None:
+        runtime = self.runtime
+        if runtime is not None:
+            with contextlib.suppress(Exception):
+                runtime.abort()
         stopped = await self.tts.stop(reason="barge-in")
         self.bus.publish("warn", "control", "stop - speech halted" if stopped else "stop - nothing in flight")
         self._broadcast_status("idle")
@@ -568,14 +707,22 @@ class Orchestrator:
             return
 
         if kind == "model_set" and intent.value:
-            result = registry.apply(model=intent.value)
-            if result["applied"]:
-                await registry.refresh_models()
-                note = "" if registry.model_verified else " It is not installed yet, so pull it first."
-                await self._say(f"Model switched to {registry.model}.{note}")
+            # "switch to rage" reads as a model switch to the grammar, because
+            # "switch to X" almost always is one. When X is plainly a
+            # disposition and plainly not a model, honour what was meant rather
+            # than answering "unknown model 'rage'".
+            if find_persona(intent.value) is not None and not registry.resolves_model(intent.value):
+                intent = Intent("persona_set", value=intent.value, raw=intent.raw)
+                kind = "persona_set"
             else:
-                await self._deny(result["errors"][0] if result["errors"] else "Model unchanged.")
-            return
+                result = registry.apply(model=intent.value)
+                if result["applied"]:
+                    await registry.refresh_models()
+                    note = "" if registry.model_verified else " It is not installed yet, so pull it first."
+                    await self._say(f"Model switched to {registry.model}.{note}")
+                else:
+                    await self._deny(result["errors"][0] if result["errors"] else "Model unchanged.")
+                return
 
         if kind == "voice_set" and intent.value:
             result = registry.apply(voice=intent.value)

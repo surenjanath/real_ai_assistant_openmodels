@@ -4,6 +4,7 @@
 
 import dynamic from "next/dynamic";
 import { useEffect } from "react";
+import AccessPanel from "./AccessPanel";
 import CommandPalette from "./CommandPalette";
 import Console from "./Console";
 import CortexPanel from "./CortexPanel";
@@ -64,10 +65,15 @@ export default function JarvisApp() {
       <Instruments />
 
       {/* One rail, so the cortex map and the vitals can never overlap however
-          tall the window is — the cortex simply takes what is left over. */}
+          tall the window is — the cortex simply takes what is left over. The
+          vitals and the panel launcher are grouped so they stay together at
+          the foot of the rail rather than being spread apart by it. */}
       <div className="left-rail">
         <CortexPanel />
-        <VitalsPanel />
+        <div className="rail-foot">
+          <VitalsPanel />
+          <AccessPanel />
+        </div>
       </div>
       <TelemetryPanel />
       <Console />

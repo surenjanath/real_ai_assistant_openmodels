@@ -50,6 +50,10 @@ class Run:
     composed: float | None = None
     spoken: float | None = None
     chars: int = 0
+    #: prompt tokens Ollama actually evaluated - the number that explains a
+    #: slow first word, since the whole prompt is re-read before any of it
+    prompt_tokens: int = 0
+    eval_tokens: int = 0
     tool_calls: int = 0
     tools_used: list[str] = field(default_factory=list)
     error: str = ""
@@ -116,6 +120,8 @@ class Run:
             "voice_ms": self.voice_ms,
             "tok_s": self.tok_s,
             "chars": self.chars,
+            "prompt_tokens": self.prompt_tokens,
+            "eval_tokens": self.eval_tokens,
             "tool_calls": self.tool_calls,
             "tools_used": self.tools_used,
             "error": self.error,

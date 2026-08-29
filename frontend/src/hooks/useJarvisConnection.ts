@@ -11,6 +11,7 @@
 import { useEffect } from "react";
 import { audioEngine, decodePcm16LE } from "@/audio/engine";
 import { audioLevels } from "@/audio/levels";
+import { clearSpoken, rememberSpoken } from "@/lib/echo";
 import { applyActivation, setGraph } from "@/state/neural";
 import { useJarvis } from "@/state/jarvis";
 import type {
@@ -24,10 +25,23 @@ import type {
 /** Module-level handle so imperative senders (input, STT) reach the socket. */
 const sockets: { logs: WebSocket | null } = { logs: null };
 
-export function sendCommand(text: string, origin: "text" | "voice" = "text"): boolean {
+/**
+ * Send a directive.
+ *
+ * `verified` says the interface has acoustic grounds to believe a person
+ * spoke — the echo-cancelled capture stream heard them. The backend runs its
+ * own echo guard on content alone, which cannot tell the operator repeating
+ * the assistant's suggestion back to it from the assistant being overheard;
+ * this is how the browser, which can tell, says so.
+ */
+export function sendCommand(
+  text: string,
+  origin: "text" | "voice" = "text",
+  verified = false,
+): boolean {
   const socket = sockets.logs;
   if (!socket || socket.readyState !== WebSocket.OPEN) return false;
-  const frame: CommandFrame = { type: "command", text, origin };
+  const frame: CommandFrame = { type: "command", text, origin, verified };
   socket.send(JSON.stringify(frame));
   return true;
 }
@@ -191,7 +205,9 @@ export function useJarvisConnection(): void {
             if (["thinking", "speaking", "idle", "listening"].includes(frame.status)) {
               s.setStatus(frame.status as AssistantStatus, frame.detail);
               // Drive the scene's "thinking" visual without React re-renders.
-              audioLevels.thinking = frame.status === "thinking" ? 1 : 0;
+              // The *target* only: the engine eases the visible value toward
+              // it, so the hologram does not jolt when an answer lands.
+              audioLevels.thinkingTarget = frame.status === "thinking" ? 1 : 0;
             }
             break;
           case "settings.update":
@@ -243,6 +259,9 @@ export function useJarvisConnection(): void {
             break;
           case "answer":
             s.setCaption(frame.text);
+            // Every word of this is on its way to the speakers, so it is also
+            // every word the microphone may shortly hear us say.
+            rememberSpoken(frame.text);
             break;
           case "transcript":
             s.pushTurn(frame.role, frame.text);
@@ -251,7 +270,10 @@ export function useJarvisConnection(): void {
             if (frame.action === "open_settings") s.setSettingsOpen(true);
             else if (frame.action === "close_settings") s.setSettingsOpen(false);
             else if (frame.action === "clear_logs") s.clearLogs();
-            else if (frame.action === "clear_transcript") s.clearTranscript();
+            else if (frame.action === "clear_transcript") {
+              s.clearTranscript();
+              clearSpoken();
+            }
             break;
           case "pong":
             if (typeof frame.ts === "number") s.setLatency(Math.max(0, Date.now() - frame.ts));
@@ -310,6 +332,7 @@ export function useJarvisConnection(): void {
             audioEngine.reset();
             audioEngine.kick();
             audioEngine.unlock();
+            rememberSpoken(frame.text);
             s.pushLog("voice", "tts", `◀ ${frame.utterance_id} [${frame.voice}] "${frame.text.slice(0, 60)}"`);
             break;
           case "tts.chunk":

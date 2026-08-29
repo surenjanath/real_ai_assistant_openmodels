@@ -26,6 +26,17 @@ export interface PersonaInfo {
   label: string;
   blurb: string;
   temperature: number;
+  /** the voice this disposition speaks in — selecting it adopts this */
+  voice?: string;
+  speed?: number;
+  /** the prompt that defines the manner; editable by the operator */
+  style?: string;
+  /** ships with the assistant, so it can be reset but never deleted */
+  builtin?: boolean;
+  /** a built-in the operator has changed — offer reset rather than delete */
+  edited?: boolean;
+  /** entirely the operator's own — deletable */
+  custom?: boolean;
 }
 
 export interface SkillInfo {
@@ -185,6 +196,9 @@ export interface MetricsRun {
   voice_ms: number | null;
   tok_s: number;
   chars: number;
+  /** prompt tokens Ollama evaluated — what a slow first word usually is */
+  prompt_tokens?: number;
+  eval_tokens?: number;
   tool_calls: number;
   tools_used: string[];
   error: string;
@@ -322,6 +336,10 @@ export interface CommandFrame {
   type: "command" | "speak" | "stop";
   text?: string;
   origin?: "text" | "voice";
+  /** The client has acoustic evidence that a person, not the assistant's own
+   *  playback, produced this transcript — so the backend's content-only echo
+   *  guard should stand down. See `frontend/src/audio/mic.ts`. */
+  verified?: boolean;
 }
 
 /** Settings delta pushed over the telemetry socket (same shape as POST /api/settings). */

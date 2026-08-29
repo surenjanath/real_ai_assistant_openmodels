@@ -11,6 +11,9 @@ why they are pinned down with a test rather than left to a listen-and-see:
    anything. If `finish()` then reports "nothing was spoken", the orchestrator
    helpfully speaks the whole answer — the exact thing the operator just cut
    off.
+3. The **spoken window** the echo guard consults. If it forgets too fast the
+   assistant answers its own voice; if a barge-in does not truncate it, the
+   assistant goes deaf to the operator for seconds after being cut off.
 
     python scripts/test_speech_stream.py
 """
@@ -120,6 +123,38 @@ async def run() -> None:
     # -- an empty stream reports honestly, so the caller can fall back -------
     empty = manager.open_stream()
     check("an empty stream reports that it said nothing", await empty.finish() is False)
+
+    # -- the spoken window, which the echo guard reads ----------------------
+    # Nothing here is audible to a test, so what is checked is the bookkeeping
+    # the guard depends on: what we said, and until when it was still sounding.
+    said = manager.open_stream()
+    said.feed("The processor is at eleven percent. ")
+    await said.finish()
+    check(
+        "what was spoken is remembered",
+        "processor" in manager.recent_speech(30.0),
+        f"window held {manager.recent_speech(30.0)!r}",
+    )
+    check(
+        "the window is bounded in time",
+        manager.recent_speech(0.0) == "" or "processor" not in manager.recent_speech(0.0),
+        "a zero-length window still returned speech",
+    )
+
+    # A barge-in stops the sound early, so the window must shrink with it -
+    # otherwise the guard keeps suppressing the operator on the strength of
+    # audio that never actually played.
+    cut = manager.open_stream()
+    cut.feed("This sentence is going to be cut off before it finishes playing. ")
+    await asyncio.sleep(0.15)
+    await manager.stop(reason="barge-in")
+    await cut.finish()
+    await asyncio.sleep(0.05)
+    check(
+        "a barge-in truncates the spoken window",
+        "cut off" not in manager.recent_speech(0.0),
+        f"window still held {manager.recent_speech(0.0)!r}",
+    )
 
     pump.cancel()
     await asyncio.gather(pump, return_exceptions=True)

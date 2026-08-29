@@ -22,6 +22,7 @@ import contextlib
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
@@ -35,6 +36,9 @@ from .segmenter import SentenceSegmenter
 class AudioClient:
     queue: asyncio.Queue
     id: str
+    #: latched once this client has fallen far enough behind to lose frames,
+    #: so the failure is reported once rather than per dropped frame
+    overflowed: bool = False
 
 
 @dataclass
@@ -166,6 +170,11 @@ class TTSManager:
         self.last_text: str = ""
         #: monotonic time at which everything streamed so far finishes playing
         self._play_deadline: float | None = None
+        #: (playback-end, text) for everything recently spoken aloud, so the
+        #: echo guard can ask "did we just say this?" of an open microphone.
+        #: Keyed on when each fragment stops *sounding*, not when it was
+        #: synthesised - that is the instant the room goes quiet again.
+        self._spoken: deque[tuple[float, str]] = deque(maxlen=24)
         #: whether the open stream has emitted any audio at all
         self.stream_audio_started = False
         self._stream: SpeechStream | None = None
@@ -180,8 +189,19 @@ class TTSManager:
 
     # -- client registry ------------------------------------------------------
 
+    #: Frames one client may fall behind before we admit defeat.
+    #:
+    #: Sized in *seconds of audio*, not frames, because the frame size is a
+    #: tunable: at 100ms frames the old 256-frame bound held only 25 seconds,
+    #: and answers here routinely run past 30 - so a long reply silently
+    #: overflowed and punched holes in itself. 3,000 frames is five minutes at
+    #: any frame size this project uses.
+    CLIENT_QUEUE_FRAMES = 3000
+
     async def subscribe(self) -> AudioClient:
-        client = AudioClient(queue=asyncio.Queue(maxsize=256), id=uuid.uuid4().hex[:8])
+        client = AudioClient(
+            queue=asyncio.Queue(maxsize=self.CLIENT_QUEUE_FRAMES), id=uuid.uuid4().hex[:8]
+        )
         self.clients[client.id] = client
         self.bus.publish("info", "audio", f"audio stream attached ({self.client_count} client(s))")
         return client
@@ -191,15 +211,26 @@ class TTSManager:
         self.bus.publish("info", "audio", f"audio stream detached ({self.client_count} client(s))")
 
     def _broadcast(self, message: dict) -> None:
+        """Fan one frame out to every attached client.
+
+        Audio is not telemetry: a dropped log line is a missing log line, but a
+        dropped PCM frame is a hole in the middle of a word, and the operator
+        hears the assistant stutter with nothing anywhere saying why. So the
+        old "make room by discarding the oldest" policy is gone. If a client is
+        genuinely this far behind it is broken, and that gets said out loud
+        rather than quietly corrupting what it does receive.
+        """
         for client in list(self.clients.values()):
             try:
                 client.queue.put_nowait(message)
             except asyncio.QueueFull:
-                try:
-                    client.queue.get_nowait()
-                    client.queue.put_nowait(message)
-                except Exception:  # pragma: no cover
-                    pass
+                if not client.overflowed:
+                    client.overflowed = True
+                    self.bus.publish(
+                        "error", "audio",
+                        f"client {client.id} is more than {self.CLIENT_QUEUE_FRAMES} frames "
+                        "behind - audio is being lost to it",
+                    )
 
     def _next_id(self) -> str:
         self._utterance_seq += 1
@@ -252,6 +283,7 @@ class TTSManager:
             self._broadcast({"type": "tts.flush", "reason": "superseded"})
             self.stream_audio_started = False
             self._play_deadline = None
+            self._truncate_spoken()
 
     async def await_stream(self) -> bool:
         task = self._current
@@ -277,6 +309,7 @@ class TTSManager:
         await asyncio.gather(task, return_exceptions=True)
         self._broadcast({"type": "tts.flush", "reason": reason})
         self._play_deadline = None
+        self._truncate_spoken()
         self._stream = None
         self.bus.publish("warn", "tts", f"utterance {reason}")
         return True
@@ -290,19 +323,19 @@ class TTSManager:
         samples = 0
         stop = threading.Event()
         producer: asyncio.Future | None = None
-        queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+        # Unbounded on purpose. The producer is a worker thread that hands over
+        # a whole sentence's frames in a burst as soon as the engine finishes
+        # it, far faster than the consumer broadcasts them; a bounded queue
+        # here therefore overflows on any fragment longer than the bound and,
+        # under the old drop-oldest policy, deleted audio from the middle of
+        # the sentence. The size is not actually unbounded in practice - one
+        # fragment is capped at `speech_max_chars`, a few seconds of PCM.
+        queue: asyncio.Queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
 
         def safe_put(item) -> None:
-            """Thread-safe enqueue that never raises into the loop."""
-            try:
-                queue.put_nowait(item)
-            except asyncio.QueueFull:
-                try:
-                    queue.get_nowait()
-                    queue.put_nowait(item)
-                except Exception:  # pragma: no cover - defensive
-                    pass
+            """Hand one frame to the loop. Never raises, never discards."""
+            queue.put_nowait(item)
 
         def produce() -> None:
             try:
@@ -345,13 +378,35 @@ class TTSManager:
                 await asyncio.gather(producer, return_exceptions=True)
         return frames, samples
 
-    def _extend_playback(self, samples: int, sample_rate: int) -> float:
+    def _extend_playback(self, samples: int, sample_rate: int, text: str = "") -> float:
         """Push the playback deadline out by the audio we just streamed."""
         duration = samples / max(1, sample_rate)
         now = time.monotonic()
         start = max(now, self._play_deadline or now)
         self._play_deadline = start + duration
+        if text:
+            self._spoken.append((self._play_deadline, text))
         return duration
+
+    # -- echo guard -----------------------------------------------------------
+
+    def recent_speech(self, window_s: float) -> str:
+        """Everything still audible, or audible within the last `window_s`.
+
+        A microphone hears the room, and a recogniser reports what it heard
+        seconds later, so "recent" has to reach back past the end of the
+        utterance rather than only covering what is playing right now.
+        """
+        cutoff = time.monotonic() - max(0.0, window_s)
+        return " ".join(text for ends_at, text in self._spoken if ends_at >= cutoff)
+
+    def _truncate_spoken(self) -> None:
+        """A barge-in silenced audio early: nothing plays past this instant."""
+        now = time.monotonic()
+        self._spoken = deque(
+            ((min(ends_at, now), text) for ends_at, text in self._spoken),
+            maxlen=self._spoken.maxlen,
+        )
 
     async def _drain_playback(self) -> None:
         remaining = (self._play_deadline or 0) - time.monotonic()
@@ -377,7 +432,7 @@ class TTSManager:
         self.bus.publish("voice", "tts", f"synthesising {len(text)} chars with {self.engine.name}")
         try:
             frames, samples = await self._synthesise(utterance_id, text, 0, on_first_audio)
-            duration = self._extend_playback(samples, sample_rate)
+            duration = self._extend_playback(samples, sample_rate, text)
             self._broadcast({
                 "type": "tts.end", "utterance_id": utterance_id,
                 "frames": frames, "duration_s": round(duration, 2),
@@ -439,7 +494,7 @@ class TTSManager:
                 frames += got_frames
                 samples += got_samples
                 fragments += 1
-                self._extend_playback(got_samples, sample_rate)
+                self._extend_playback(got_samples, sample_rate, fragment)
 
             if fragments:
                 duration = samples / max(1, sample_rate)

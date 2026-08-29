@@ -290,34 +290,11 @@ export default function TelemetryPanel() {
             </button>
           ))}
         </span>
+        {/* Archive, reference and settings used to live here as bare glyphs.
+            They are labelled buttons in the ACCESS card now, under the vitals,
+            which leaves this header to say the one thing it is for: whether
+            the uplink is live. */}
         <span className="telemetry-header-actions">
-          <button
-            className="gear"
-            onClick={() => useJarvis.getState().setOverlay("archive")}
-            title="Archive — past conversations & audit trail"
-            aria-label="Open the archive"
-            type="button"
-          >
-            ⌗
-          </button>
-          <button
-            className="gear"
-            onClick={() => useJarvis.getState().setOverlay("help")}
-            title="Reference card — shortcuts & phrases (?)"
-            aria-label="Open the reference card"
-            type="button"
-          >
-            ?
-          </button>
-          <button
-            className="gear"
-            onClick={() => useJarvis.getState().setSettingsOpen(true)}
-            title="Settings (or say “settings”)"
-            aria-label="Open settings"
-            type="button"
-          >
-            ⚙
-          </button>
           <span className={`telemetry-link ${connected ? "linked" : ""}`}>
             {connected ? "LINKED" : "RECONNECTING"}
           </span>

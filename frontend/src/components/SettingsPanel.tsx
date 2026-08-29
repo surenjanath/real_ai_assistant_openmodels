@@ -24,9 +24,51 @@ import { audioEngine } from "@/audio/engine";
 import { pullModel } from "@/hooks/useJarvisConnection";
 import { THEMES, useJarvis, type Theme } from "@/state/jarvis";
 import { PROFILES, TIERS, quality, resetQuality, setQuality, type Quality } from "@/state/quality";
-import type { LogLevel } from "@/lib/protocol";
+import type { LogLevel, PersonaInfo, SettingsState } from "@/lib/protocol";
 
 type SaveState = "idle" | "saving" | "ok" | "error";
+
+/** A disposition being written, before it is saved. `null` = editor closed. */
+type Draft = {
+  key: string | null; // null while creating; set when editing an existing one
+  label: string;
+  blurb: string;
+  style: string;
+  voice: string;
+  speed: number;
+  temperature: number;
+  builtin: boolean;
+  edited: boolean;
+  custom: boolean;
+};
+
+const BLANK: Draft = {
+  key: null,
+  label: "",
+  blurb: "",
+  style: "",
+  voice: "bm_george",
+  speed: 1,
+  temperature: 0.6,
+  builtin: false,
+  edited: false,
+  custom: false,
+};
+
+function draftOf(p: PersonaInfo): Draft {
+  return {
+    key: p.key,
+    label: p.label,
+    blurb: p.blurb,
+    style: p.style ?? "",
+    voice: p.voice ?? "bm_george",
+    speed: p.speed ?? 1,
+    temperature: p.temperature ?? 0.6,
+    builtin: Boolean(p.builtin),
+    edited: Boolean(p.edited),
+    custom: Boolean(p.custom),
+  };
+}
 
 export default function SettingsPanel() {
   const open = useJarvis((s) => s.settingsOpen);
@@ -49,6 +91,8 @@ export default function SettingsPanel() {
   // for it; this mirror exists purely to repaint the buttons below.
   const [tier, setTier] = useState<Quality>(quality.tier);
   const [tierAuto, setTierAuto] = useState(quality.auto);
+  const [draft, setDraft] = useState<Draft | null>(null);
+  const [draftError, setDraftError] = useState("");
 
   useEffect(() => {
     if (!open) return;
@@ -95,6 +139,66 @@ export default function SettingsPanel() {
       setSave("error");
       setDetail(message);
       pushLog("error", "settings", `panel: ${message}`);
+    } finally {
+      setTimeout(() => setSave("idle"), 2400);
+    }
+  };
+
+  /** Create or update a disposition, then adopt it if it is the live one. */
+  const saveDraft = async () => {
+    if (!draft) return;
+    setSave("saving");
+    setDraftError("");
+    try {
+      const res = await fetch("/api/personas", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          key: draft.key ?? undefined,
+          label: draft.label,
+          blurb: draft.blurb,
+          style: draft.style,
+          voice: draft.voice,
+          speed: draft.speed,
+          temperature: draft.temperature,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      setSettings({ personas: data.personas } as Partial<SettingsState>);
+      pushLog("success", "settings", `disposition '${draft.label}' saved`);
+      setDraft(null);
+      setSave("ok");
+      setDetail(`saved ${draft.label}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setDraftError(message);
+      setSave("error");
+    } finally {
+      setTimeout(() => setSave("idle"), 2400);
+    }
+  };
+
+  /** Delete a custom disposition, or reset an edited built-in to how it shipped. */
+  const removeDraft = async () => {
+    if (!draft?.key) return;
+    setSave("saving");
+    setDraftError("");
+    try {
+      const res = await fetch(`/api/personas/${encodeURIComponent(draft.key)}`, {
+        method: "DELETE",
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      setSettings({ personas: data.personas } as Partial<SettingsState>);
+      pushLog("info", "settings", `disposition '${draft.key}' ${data.result}`);
+      setDraft(null);
+      setSave("ok");
+      setDetail(`${draft.key} ${data.result}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setDraftError(message);
+      setSave("error");
     } finally {
       setTimeout(() => setSave("idle"), 2400);
     }
@@ -289,19 +393,178 @@ export default function SettingsPanel() {
             </span>
             <div className="persona-grid">
               {(settings.personas ?? []).map((persona) => (
-                <button
+                <div
                   key={persona.key}
-                  type="button"
                   className={`persona ${settings.persona === persona.key ? "on" : ""}`}
-                  onClick={() => apply({ persona: persona.key })}
-                  disabled={save === "saving"}
-                  title={persona.blurb}
                 >
-                  <b>{persona.label}</b>
-                  <em>{persona.blurb}</em>
-                </button>
+                  {/* Selecting and editing are separate targets. A single card
+                      that did both would make every edit a disposition switch
+                      as a side effect. */}
+                  <button
+                    type="button"
+                    className="persona-pick"
+                    onClick={() => apply({ persona: persona.key })}
+                    disabled={save === "saving"}
+                    title={persona.blurb}
+                  >
+                    <b>{persona.label}</b>
+                    <em>{persona.blurb}</em>
+                    {/* Choosing a disposition moves the voice with it, so the
+                        card says which one rather than letting the VOICE control
+                        appear to change on its own. */}
+                    {persona.voice && (
+                      <i className="persona-voice">
+                        {settings.voice_labels?.[persona.voice] ?? persona.voice}
+                        {persona.custom ? " · yours" : persona.edited ? " · edited" : ""}
+                      </i>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    className="persona-edit"
+                    onClick={() => {
+                      setDraftError("");
+                      setDraft(draftOf(persona));
+                    }}
+                    title={`Edit ${persona.label}`}
+                    aria-label={`Edit ${persona.label}`}
+                  >
+                    ✎
+                  </button>
+                </div>
               ))}
+              <button
+                type="button"
+                className="persona persona-new"
+                onClick={() => {
+                  setDraftError("");
+                  setDraft({ ...BLANK, voice: settings.voice ?? BLANK.voice });
+                }}
+                title="Write a disposition of your own"
+              >
+                <b>+ NEW</b>
+                <em>Write your own manner</em>
+              </button>
             </div>
+
+            {draft && (
+              <div className="persona-editor">
+                <div className="persona-editor-head">
+                  <b>{draft.key ? `EDIT ${draft.label.toUpperCase()}` : "NEW DISPOSITION"}</b>
+                  {draft.builtin && (
+                    <em>
+                      built in — your changes are saved alongside it and can be undone
+                    </em>
+                  )}
+                </div>
+
+                <label className="persona-row">
+                  <span>NAME</span>
+                  <input
+                    value={draft.label}
+                    maxLength={24}
+                    placeholder="PIRATE"
+                    onChange={(e) => setDraft({ ...draft, label: e.target.value })}
+                  />
+                </label>
+
+                <label className="persona-row">
+                  <span>SUMMARY</span>
+                  <input
+                    value={draft.blurb}
+                    maxLength={120}
+                    placeholder="What it is like, in a few words"
+                    onChange={(e) => setDraft({ ...draft, blurb: e.target.value })}
+                  />
+                </label>
+
+                <label className="persona-row tall">
+                  <span>MANNER</span>
+                  <textarea
+                    value={draft.style}
+                    maxLength={2000}
+                    rows={6}
+                    placeholder="Written to the model, in the second person: “Be warm and quick. Two sentences.” Examples of the finished register work far better than rules."
+                    onChange={(e) => setDraft({ ...draft, style: e.target.value })}
+                  />
+                </label>
+
+                <label className="persona-row">
+                  <span>VOICE</span>
+                  <select
+                    value={draft.voice}
+                    onChange={(e) => setDraft({ ...draft, voice: e.target.value })}
+                  >
+                    {(settings.voices ?? []).map((v) => (
+                      <option key={v} value={v}>
+                        {settings.voice_labels?.[v] ?? v} · {v}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="persona-row">
+                  <span>RATE {draft.speed.toFixed(2)}×</span>
+                  <input
+                    type="range"
+                    min={0.5}
+                    max={2}
+                    step={0.01}
+                    value={draft.speed}
+                    onChange={(e) => setDraft({ ...draft, speed: Number(e.target.value) })}
+                  />
+                </label>
+
+                <label className="persona-row">
+                  <span>WARMTH {draft.temperature.toFixed(2)}</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={1.5}
+                    step={0.05}
+                    value={draft.temperature}
+                    onChange={(e) =>
+                      setDraft({ ...draft, temperature: Number(e.target.value) })
+                    }
+                  />
+                </label>
+
+                {draftError && <div className="persona-error">{draftError}</div>}
+
+                <div className="persona-actions">
+                  <button
+                    type="button"
+                    className="settings-btn on"
+                    onClick={saveDraft}
+                    disabled={save === "saving"}
+                  >
+                    SAVE
+                  </button>
+                  <button
+                    type="button"
+                    className="settings-btn"
+                    onClick={() => {
+                      setDraft(null);
+                      setDraftError("");
+                    }}
+                  >
+                    CANCEL
+                  </button>
+                  {/* A built-in is reset, never removed: a saved preference or
+                      a spoken phrase may still name it. */}
+                  {(draft.custom || draft.edited) && (
+                    <button
+                      type="button"
+                      className="settings-btn danger"
+                      onClick={removeDraft}
+                      disabled={save === "saving"}
+                    >
+                      {draft.edited ? "RESET TO DEFAULT" : "DELETE"}
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
 
           <label className="settings-field">

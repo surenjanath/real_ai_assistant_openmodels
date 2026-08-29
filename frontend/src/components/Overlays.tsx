@@ -157,7 +157,7 @@ function MetricsView() {
 const DANGER_NOTE: Record<string, string> = {
   safe: "no side effects",
   reads_files: "reads files inside the permitted workspace",
-  executes: "runs an allow-listed shell command",
+  executes: "spawns a process on this machine",
   network: "makes a network request",
   writes_files: "writes into the assistant's own scratch folder only",
 };

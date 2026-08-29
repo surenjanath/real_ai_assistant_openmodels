@@ -187,19 +187,30 @@ class Memory:
         return [dict(r) for r in reversed(rows)]
 
     def search(self, query: str, limit: int = 6,
-               exclude_ids: tuple[int, ...] = ()) -> list[Recollection]:
+               exclude_ids: tuple[int, ...] = (),
+               roles: tuple[str, ...] = ()) -> list[Recollection]:
         """Rank past turns against a natural-language query.
 
         `exclude_ids` keeps the turn currently being answered out of its own
         recall — without it the assistant "remembers" the question it was just
         asked, one second ago, and dutifully reports it back.
+
+        `roles` narrows to particular speakers. It exists for a specific
+        failure: an assistant turn is not evidence of anything — it is an
+        unverified generation — and feeding one back as context lets a single
+        wrong answer harden into a permanent belief. See
+        `Orchestrator._recall_context`.
         """
         terms = [t for t in re.findall(r"[a-z0-9']{3,}", query.lower()) if t not in _STOPWORDS]
         if not terms:
             return []
         skip = tuple(int(i) for i in exclude_ids)
+        wanted = tuple(roles)
         # Over-fetch so excluded rows do not eat into the requested limit.
-        fetch = limit + len(skip)
+        fetch = limit + len(skip) + (limit * 3 if wanted else 0)
+
+        def keep(role: str, row_id: int) -> bool:
+            return row_id not in skip and (not wanted or role in wanted)
 
         if self.fts:
             match = " OR ".join(terms)
@@ -213,7 +224,7 @@ class Memory:
                 # bm25 is "lower is better"; map into a 0..1 relevance.
                 return [
                     Recollection(r["role"], r["text"], r["ts"], 1.0 / (1.0 + abs(r["rank"])))
-                    for r in rows if r["id"] not in skip
+                    for r in rows if keep(r["role"], r["id"])
                 ][:limit]
             except sqlite3.OperationalError:
                 self.fts = False
@@ -223,7 +234,7 @@ class Memory:
         ).fetchall()
         scored: list[Recollection] = []
         for row in rows:
-            if row["id"] in skip:
+            if not keep(row["role"], row["id"]):
                 continue
             hay = row["text"].lower()
             hits = sum(1 for t in terms if t in hay)

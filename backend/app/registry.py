@@ -108,6 +108,9 @@ class Registry:
     #: notified with the new tag whenever the crew model changes, so the
     #: runtime can page the new weights in before the next directive lands
     on_model_change: object | None = None
+    #: notified when the disposition changes, so the runtime can shed the
+    #: previous voice from its working context - see `_notify_persona`
+    on_persona_change: object | None = None
     #: durable operator preferences; saved choices outrank env defaults
     prefs: Prefs = field(default_factory=Prefs)
     _engine: object | None = None
@@ -276,6 +279,36 @@ class Registry:
         # Unknown tag: allow it (the user may pull it next), if it looks like one.
         return value if re.fullmatch(r"[\w.\-]+(:[\w.\-]+)?", value) else None
 
+    def resolve_voice(self, value: str) -> str | None:
+        """Public voice lookup, for callers validating an operator's input."""
+        return self._resolve_voice(value)
+
+    def reconcile_persona(self) -> None:
+        """Re-apply the selected disposition after its definition changed.
+
+        Editing the persona that is currently active has to move the voice and
+        speed with it, exactly as selecting it would - otherwise an edit to the
+        live disposition appears to do nothing until you switch away and back.
+        """
+        persona = find_persona(self.persona)
+        if persona is None:
+            return
+        engine_changed = False
+        wanted = self._resolve_voice(persona.voice)
+        if wanted and wanted != self.voice:
+            self.voice = wanted
+            engine_changed = True
+        rate = max(0.5, min(2.0, round(float(persona.speed), 2)))
+        if abs(rate - self.speed) > 0.001:
+            self.speed = rate
+            engine_changed = True
+        if engine_changed:
+            self._mirror_engine()
+
+    def resolves_model(self, value: str) -> bool:
+        """Would `value` name a model? Used to disambiguate 'switch to X'."""
+        return self._resolve_model(value) is not None
+
     def _resolve_voice(self, value: str) -> str | None:
         value = value.strip().strip(".,!?\"'").lower().replace(" ", "_").replace("-", "_")
         if value in self.voices:
@@ -348,6 +381,23 @@ class Registry:
             elif resolved_persona.key != self.persona:
                 self.persona = resolved_persona.key
                 applied["persona"] = resolved_persona.key
+                self._notify_persona(resolved_persona.key)
+                # A disposition is how the assistant sounds as much as what it
+                # says: leaving the butler's voice on a furious one, or a
+                # British one on the Trini, is the thing that made switching
+                # feel unfinished. An explicit voice in the *same* request still
+                # wins, so "switch to Friday with the George voice" does what it
+                # says and the settings panel can override either independently.
+                if not voice:
+                    wanted = self._resolve_voice(resolved_persona.voice)
+                    if wanted and wanted != self.voice:
+                        self.voice = wanted
+                        applied["voice"] = wanted
+                if speed is None:
+                    rate = max(0.5, min(2.0, round(float(resolved_persona.speed), 2)))
+                    if abs(rate - self.speed) > 0.001:
+                        self.speed = rate
+                        applied["speed"] = rate
 
         if tools is not None:
             want = bool(tools)
@@ -404,6 +454,16 @@ class Registry:
             if ok else f"could not erase preferences: {self.prefs.error}",
         )
         return ok
+
+    def _notify_persona(self, key: str) -> None:
+        """Fire the persona-change hook without ever letting it break `apply`."""
+        hook = self.on_persona_change
+        if hook is None:
+            return
+        try:
+            hook(key)  # type: ignore[operator]
+        except Exception as exc:  # noqa: BLE001
+            self.bus.publish("warn", "settings", f"persona hook failed: {type(exc).__name__}")
 
     def _notify_model(self, tag: str) -> None:
         """Fire the model-change hook without ever letting it break `apply`."""

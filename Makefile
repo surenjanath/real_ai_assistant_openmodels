@@ -65,6 +65,12 @@ test:
 	echo; \
 	./.venv/bin/python scripts/test_speech_stream.py; \
 	echo; \
+	./.venv/bin/python scripts/test_echo.py; \
+	echo; \
+	./.venv/bin/python scripts/test_barge_in.py; \
+	echo; \
+	./.venv/bin/python scripts/test_skills.py; \
+	echo; \
 	./.venv/bin/python scripts/test_guards.py
 
 smoke:

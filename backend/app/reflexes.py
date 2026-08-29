@@ -23,11 +23,13 @@ interface shows the shortcut being taken.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable
 
-from .skills import SkillError, safe_eval
+from .skills import SkillError, parse_date, safe_eval
 
 #: Spoken arithmetic -> operators. Ordered longest-first so "multiplied by"
 #: is consumed before "by" could ever be considered.
@@ -68,6 +70,29 @@ _LIVE_WORDS = re.compile(
 _TIME_WORDS = re.compile(
     r"\b(today|tonight|tomorrow|yesterday|this (?:week|month|year)|"
     r"how (?:long|many days)|what day|current (?:date|time))\b",
+    re.I,
+)
+
+#: "how many days until Christmas" / "how long since the 3rd of March".
+#: Counting days across month lengths and leap years is the same class of
+#: failure as long multiplication: the model is fluent, confident and wrong,
+#: and whether it reaches for the tool that would fix it is a coin toss.
+_DATE_SPAN = re.compile(
+    r"how\s+(?:many\s+days|long)\s+(?:is\s+it\s+)?"
+    r"(until|til|till|to|before|since|after)\s+(.{2,60}?)\s*[?.!]*$",
+    re.I,
+)
+#: Words that attach to a date in speech but mean nothing to the parser.
+_DATE_NOISE = re.compile(r"^(?:the|it is|it's|we get to|we reach)\s+|\s+(?:comes|arrives)$", re.I)
+
+#: "the sha256 of the word jarvis". The worst case of the whole family: a
+#: digest is sixty-four characters of high-entropy hex, so a model asked for
+#: one produces something that looks exactly right and is entirely invented -
+#: and nobody reading the answer can tell.
+_DIGEST = re.compile(
+    r"\b(md5|sha-?1|sha-?256|sha-?512)\b[^\w]*(?:hash|digest|sum|checksum)?[^\w]*"
+    r"(?:of|for)\s+(?:the\s+)?(?:word|string|text|phrase|value)?\s*"
+    r"[\"\u201c\u2018']?([^\"\u201d\u2019'?!.]{1,120}?)[\"\u201d\u2019']?\s*[?.!]*$",
     re.I,
 )
 
@@ -149,6 +174,47 @@ def detect(text: str, *, vitals: dict[str, Any] | None = None,
             parts.append("load " + " ".join(f"{v:.2f}" for v in vitals["load"][:3]))
         if parts:
             reflexes.append(Reflex("sense.host", "live host state", "; ".join(parts)))
+
+    digest = _DIGEST.search(text.strip())
+    if digest is not None:
+        algorithm = digest.group(1).lower().replace("-", "")
+        subject = digest.group(2).strip()
+        if subject:
+            value = hashlib.new(algorithm, subject.encode("utf-8")).hexdigest()
+            reflexes.append(Reflex(
+                "motor.tools", f"exact {algorithm} digest",
+                f'{algorithm} of "{subject}" = {value}',
+            ))
+
+    span = _DATE_SPAN.search(text.strip())
+    if span is not None:
+        direction = span.group(1).lower()
+        phrase = _DATE_NOISE.sub("", span.group(2).strip()).strip()
+        # "since"/"after" look backwards, so a bare "1 January" means the one
+        # that has been, not the one to come - otherwise every such question is
+        # answered a full year out.
+        prefer = "past" if direction in ("since", "after") else "future"
+        try:
+            target = parse_date(phrase, prefer=prefer)
+        except SkillError:
+            target = None  # ambiguous or impossible - say nothing rather than guess
+        if target is not None:
+            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            days = (target - today).days
+            # "until" a past date, or "since" a future one, means the question
+            # and the calendar disagree; report the direction rather than a
+            # negative number the model will read out as if it were positive.
+            when = target.strftime("%A, %-d %B %Y")
+            if days == 0:
+                detail = f"{phrase} is today, {when}"
+            elif days > 0:
+                detail = (f"{phrase} is {when}, {days} day{'s' if days != 1 else ''} "
+                          f"from today ({days // 7} week{'s' if days // 7 != 1 else ''} "
+                          f"and {days % 7} day{'s' if days % 7 != 1 else ''})")
+            else:
+                detail = (f"{phrase} was {when}, {-days} day{'s' if days != -1 else ''} "
+                          "ago")
+            reflexes.append(Reflex("motor.tools", "exact date arithmetic", detail))
 
     if now_provider is not None and _TIME_WORDS.search(text):
         stamp = now_provider()

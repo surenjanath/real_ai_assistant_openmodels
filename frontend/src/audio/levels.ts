@@ -26,8 +26,10 @@ export interface AudioLevels {
   speaking: boolean;
   /** true while the mic is capturing */
   listening: boolean;
-  /** 0..1 ramp toward the "thinking" visual state */
+  /** 0..1 ramp toward the "thinking" visual state, eased by the engine */
   thinking: number;
+  /** where `thinking` is heading: set by the transport, never read by the scene */
+  thinkingTarget: number;
 }
 
 export const BAND_COUNT = 64;
@@ -44,4 +46,5 @@ export const audioLevels: AudioLevels = {
   speaking: false,
   listening: false,
   thinking: 0,
+  thinkingTarget: 0,
 };

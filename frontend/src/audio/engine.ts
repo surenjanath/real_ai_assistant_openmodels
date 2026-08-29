@@ -20,6 +20,16 @@ const SMOOTH_UP = 0.5;
 const SMOOTH_DOWN = 0.09;
 /** Input gain on raw analyser energy - the hologram should feel ALIVE. */
 const SENSITIVITY = 1.6;
+/**
+ * Gain multiplier while the operator is talking over the assistant.
+ *
+ * Not silence: the answer keeps playing quietly, so if the interruption turns
+ * out to have been a cough or a door, nothing was lost. The full stop only
+ * happens once a transcript confirms a person actually said something.
+ */
+const DUCK = 0.22;
+/** Seconds for the gain to reach a new level - fast, but not a click. */
+const GAIN_RAMP = 0.05;
 
 export class AudioEngine {
   private ctx: AudioContext | null = null;
@@ -35,6 +45,29 @@ export class AudioEngine {
   private onStateChange: ((unlocked: boolean) => void) | null = null;
   private volume = 0.9;
   private muted = false;
+  private ducked = false;
+  /**
+   * Accumulated phase of the idle "breathing" animation.
+   *
+   * Integrated rather than derived from the clock, because its rate changes
+   * with `thinking`. `sin(elapsed * rate)` looks continuous only while `rate`
+   * is constant: change the rate and the argument jumps by `elapsed * delta`,
+   * which after a few minutes of uptime is hundreds of radians. The hologram
+   * appeared to restart its animation the instant an answer finished, exactly
+   * when `thinking` fell back to zero. Integrating `dt * rate` instead means
+   * the rate can move freely and the phase never does.
+   */
+  private idlePhase = 0;
+  /**
+   * Wall-clock ms at which the last scheduled audio stops sounding.
+   *
+   * Deliberately separate from `pending`, which is measured against the audio
+   * clock and is reset to zero by `reset()` at the start of every utterance
+   * and momentarily between fragments. The echo guard needs a monotonic "the
+   * room was loud until at least here" mark that survives both, because a
+   * recogniser reports what it heard long after the sound has stopped.
+   */
+  private outputUntil = 0;
 
   /** Lazily build the graph - safe to call repeatedly. */
   ensure(): AudioContext | null {
@@ -100,12 +133,40 @@ export class AudioEngine {
 
   setVolume(value: number): void {
     this.volume = Math.max(0, Math.min(1, value));
-    if (this.gain) this.gain.gain.value = this.muted ? 0 : this.volume;
+    this.applyGain();
   }
 
   setMuted(muted: boolean): void {
     this.muted = muted;
-    if (this.gain) this.gain.gain.value = muted ? 0 : this.volume;
+    this.applyGain();
+  }
+
+  /**
+   * Drop to a murmur because someone in the room started talking.
+   *
+   * This is the immediate half of barge-in. Waiting for a transcript before
+   * reacting means the assistant talks over the operator for the second or so
+   * the recogniser takes to make up its mind, which is precisely the moment
+   * the interruption needed to be acknowledged.
+   */
+  setDucked(ducked: boolean): void {
+    if (this.ducked === ducked) return;
+    this.ducked = ducked;
+    this.applyGain();
+  }
+
+  private applyGain(): void {
+    if (!this.gain) return;
+    const target = this.muted ? 0 : this.volume * (this.ducked ? DUCK : 1);
+    const ctx = this.ctx;
+    if (!ctx) {
+      this.gain.gain.value = target;
+      return;
+    }
+    // Ramped, not assigned: a step change in gain mid-waveform is an audible
+    // click, and this fires every time the operator opens their mouth.
+    this.gain.gain.cancelScheduledValues(ctx.currentTime);
+    this.gain.gain.setTargetAtTime(target, ctx.currentTime, GAIN_RAMP);
   }
 
   /** Transient impulse - call when an utterance starts. */
@@ -132,8 +193,33 @@ export class AudioEngine {
     if (this.nextTime < now + 0.06) this.nextTime = now + 0.06;
     source.start(this.nextTime);
     this.nextTime += frameCount / sampleRate;
+    // Only while the context is actually running. A suspended context still
+    // advances the schedule but emits no sound, and claiming the room was
+    // loud when it was silent would have the echo guard discard everything
+    // the operator says while audio is autoplay-locked.
+    if (ctx.state === "running") {
+      this.outputUntil = Math.max(
+        this.outputUntil,
+        Date.now() + Math.max(0, this.nextTime - ctx.currentTime) * 1000,
+      );
+    }
     this.scheduled.add(source);
     source.onended = () => this.scheduled.delete(source);
+  }
+
+  /** Wall-clock ms at which the speakers fall silent (past = silent now). */
+  get speakingUntil(): number {
+    return this.outputUntil;
+  }
+
+  /**
+   * Was the assistant audible at any point in the window ending now?
+   *
+   * `hangoverMs` extends the window past the last sample so that room
+   * reverberation, and the recogniser's own buffering, are still covered.
+   */
+  audibleWithin(sinceMs: number, hangoverMs = 0): boolean {
+    return this.outputUntil + hangoverMs >= sinceMs;
   }
 
   /** Barge-in: stop everything already scheduled, immediately. */
@@ -148,6 +234,12 @@ export class AudioEngine {
     }
     this.scheduled.clear();
     this.reset();
+    // Barge-in cut the sound off here, so the room is quiet from now - not
+    // from wherever the schedule happened to reach.
+    this.outputUntil = Math.min(this.outputUntil, Date.now());
+    // Nothing is playing, so there is nothing to duck; leaving it engaged
+    // would start the next utterance at a whisper.
+    this.setDucked(false);
   }
 
   /** Drop the scheduling cursor back to now (does not stop live sources). */
@@ -164,6 +256,16 @@ export class AudioEngine {
   /** Called every animation frame from the 3D loop. */
   tick(dt: number, elapsed: number): void {
     audioLevels.kick *= Math.exp(-dt * 3.2);
+
+    // Ease `thinking` toward its target rather than letting the transport step
+    // it. It scales several idle amplitudes, and a hard 1 -> 0 the moment an
+    // answer lands reads as the visual restarting.
+    audioLevels.thinking +=
+      (audioLevels.thinkingTarget - audioLevels.thinking) * Math.min(1, dt * 3.5);
+
+    // Advanced every frame, including while speaking, so the idle animation
+    // resumes from where it was rather than from wherever the wall clock is.
+    this.idlePhase = (this.idlePhase + dt * (1.4 + audioLevels.thinking * 3.5)) % (Math.PI * 2);
 
     const analyser = this.analyser;
     const speaking = this.pending > 0.01;
@@ -215,7 +317,7 @@ export class AudioEngine {
     } else {
       // Idle: gentle breathing so the core feels alive between utterances.
       const think = audioLevels.thinking;
-      const pulse = 0.5 + 0.5 * Math.sin(elapsed * (1.4 + think * 3.5));
+      const pulse = 0.5 + 0.5 * Math.sin(this.idlePhase);
       level = 0.05 + 0.04 * pulse + think * 0.14;
       bass = 0.2 + 0.12 * (0.5 + 0.5 * Math.sin(elapsed * 0.9)) + think * 0.2;
       treble = 0.1 + think * 0.1;

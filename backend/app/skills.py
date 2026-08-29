@@ -30,6 +30,7 @@ record of what the assistant did.
 from __future__ import annotations
 
 import ast
+import hashlib
 import html
 import ipaddress
 import json
@@ -485,6 +486,238 @@ def parse_when(text: str, now: datetime | None = None) -> datetime | None:
     return None
 
 
+# ----------------------------------------------------------------- calendar
+
+_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+_WEEKDAYS = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+#: Fixed-date holidays people actually say out loud instead of a date. Only
+#: ones that fall on the same day every year - Easter and the like move, and a
+#: wrong answer delivered confidently is worse than "I could not read that".
+_HOLIDAYS = {
+    "christmas": (12, 25), "christmas day": (12, 25), "xmas": (12, 25),
+    "christmas eve": (12, 24), "boxing day": (12, 26),
+    "new year": (1, 1), "new years": (1, 1), "new year's": (1, 1),
+    "new year's day": (1, 1), "new years day": (1, 1),
+    "new year's eve": (12, 31), "new years eve": (12, 31),
+    "halloween": (10, 31), "hallowe'en": (10, 31),
+    "valentine's day": (2, 14), "valentines day": (2, 14), "valentines": (2, 14),
+}
+
+#: dd/mm vs mm/dd is unknowable from the digits alone, so it is refused rather
+#: than guessed - see `parse_date`.
+_SLASHED = re.compile(r"^\d{1,2}[/.]\d{1,2}[/.]\d{2,4}$")
+
+
+def _month_from(word: str) -> int | None:
+    key = word.strip(",.").lower()[:4]
+    return _MONTHS.get(key) or _MONTHS.get(key[:3])
+
+
+def _add_months(date: datetime, months: int) -> datetime:
+    """Shift by whole months, clamping the day to the target month's length.
+
+    31 January plus one month is 28 February (29 in a leap year). Every
+    calendar library makes this same choice; the alternative is rolling into
+    March, which is never what anyone means by "next month".
+    """
+    total = (date.year * 12 + date.month - 1) + months
+    year, month = divmod(total, 12)
+    month += 1
+    import calendar as _calendar  # noqa: PLC0415 - only needed here
+    day = min(date.day, _calendar.monthrange(year, month)[1])
+    return date.replace(year=year, month=month, day=day)
+
+
+def parse_date(text: str, now: datetime | None = None, *,
+               prefer: str = "future") -> datetime | None:
+    """Turn a written date into a datetime at midnight, or None.
+
+    Accepts ISO (``2026-12-25``), written forms (``25 December 2026``,
+    ``Dec 25 2026``), relative words (``today``, ``tomorrow``, ``in 10 days``,
+    ``next friday``), fixed-date holidays (``Christmas``, ``Halloween``) and a
+    bare day-and-month (``25 December``).
+
+    A date with no year is inherently two dates, so `prefer` picks between
+    them: ``"future"`` (the default) resolves to the next occurrence, which is
+    what "days until Christmas" means in any month, and ``"past"`` resolves to
+    the last one, which is what "days since New Year" means. Getting this wrong
+    is a whole year of error delivered with total confidence.
+
+    Purely numeric slashed dates are deliberately *not* accepted: 03/04/2026 is
+    the third of April to most of the world and the fourth of March to the
+    United States, and silently picking one is how a reminder lands a month
+    late. The caller is asked for ISO instead.
+    """
+    now = (now or datetime.now()).replace(hour=0, minute=0, second=0, microsecond=0)
+    t = " ".join((text or "").strip().lower().split())
+    if not t:
+        return None
+
+    holiday = _HOLIDAYS.get(t.removeprefix("the ").strip())
+    if holiday is not None:
+        month, day = holiday
+        candidate = datetime(now.year, month, day)
+        if prefer == "past" and candidate > now:
+            return datetime(now.year - 1, month, day)
+        if prefer != "past" and candidate < now:
+            return datetime(now.year + 1, month, day)
+        return candidate
+
+    if t in ("today", "now"):
+        return now
+    if t == "tomorrow":
+        return now + timedelta(days=1)
+    if t == "yesterday":
+        return now - timedelta(days=1)
+
+    match = re.fullmatch(r"in\s+(\d+)\s+(day|days|week|weeks|month|months|year|years)", t)
+    if match:
+        count = int(match.group(1))
+        unit = match.group(2).rstrip("s")
+        if unit == "day":
+            return now + timedelta(days=count)
+        if unit == "week":
+            return now + timedelta(weeks=count)
+        if unit == "month":
+            return _add_months(now, count)
+        return _add_months(now, count * 12)
+
+    match = re.fullmatch(r"(\d+)\s+(day|days|week|weeks|month|months|year|years)\s+ago", t)
+    if match:
+        count = int(match.group(1))
+        unit = match.group(2).rstrip("s")
+        if unit == "day":
+            return now - timedelta(days=count)
+        if unit == "week":
+            return now - timedelta(weeks=count)
+        if unit == "month":
+            return _add_months(now, -count)
+        return _add_months(now, -count * 12)
+
+    match = re.fullmatch(r"(next|last|this)\s+(\w+)", t)
+    if match and match.group(2) in _WEEKDAYS:
+        target = _WEEKDAYS[match.group(2)]
+        direction = match.group(1)
+        delta = (target - now.weekday()) % 7
+        if direction == "next":
+            return now + timedelta(days=delta or 7)
+        if direction == "last":
+            back = (now.weekday() - target) % 7
+            return now - timedelta(days=back or 7)
+        return now + timedelta(days=delta)
+    if t in _WEEKDAYS:
+        return now + timedelta(days=(_WEEKDAYS[t] - now.weekday()) % 7 or 7)
+
+    if _SLASHED.fullmatch(t):
+        raise SkillError(
+            f"'{text}' is ambiguous - 03/04 is the 3rd of April in most places and "
+            "the 4th of March in the US. Give it as YYYY-MM-DD."
+        )
+
+    iso = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", t)
+    if iso:
+        try:
+            return datetime(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+        except ValueError as exc:
+            raise SkillError(f"'{text}' is not a real date ({exc})") from exc
+
+    # "25 december 2026" / "december 25, 2026" / "25 dec"
+    words = t.replace(",", " ").split()
+    day = month = year = None
+    for word in words:
+        if month is None and (found := _month_from(word)) is not None:
+            month = found
+            continue
+        if word.isdigit():
+            number = int(word)
+            if len(word) == 4 and year is None:
+                year = number
+            elif day is None and 1 <= number <= 31:
+                day = number
+        elif (stripped := re.fullmatch(r"(\d{1,2})(st|nd|rd|th)", word)) and day is None:
+            day = int(stripped.group(1))
+    if month is not None and day is not None:
+        if year is None:
+            try:
+                candidate = datetime(now.year, month, day)
+            except ValueError as exc:
+                raise SkillError(f"'{text}' is not a real date ({exc})") from exc
+            # A bare day-and-month is two dates a year apart; `prefer` says
+            # which one was meant.
+            if prefer == "past" and candidate > now:
+                return datetime(now.year - 1, month, day)
+            if prefer != "past" and candidate < now:
+                return datetime(now.year + 1, month, day)
+            return candidate
+        try:
+            return datetime(year, month, day)
+        except ValueError as exc:
+            raise SkillError(f"'{text}' is not a real date ({exc})") from exc
+
+    return None
+
+
+# ------------------------------------------------------- schema gating
+
+#: Attached to every request: applicable to almost any directive, and cheap.
+_CORE_SKILLS = frozenset({
+    "get_datetime", "calculate", "recall", "remember", "system_status",
+    "convert_units", "web_search",
+})
+
+#: (trigger, skills) - a cluster is described to the model only when the
+#: directive plainly touches it. Patterns are deliberately generous: the cost
+#: of matching too eagerly is a slightly larger prompt, and the cost of missing
+#: is the assistant unable to do what was asked.
+_SKILL_GROUPS: list[tuple[re.Pattern[str], frozenset[str]]] = [
+    (re.compile(r"\b(file|files|folder|directory|directories|path|disk|space|"
+                r"document|script|code|search|find|grep|read|wrote|written|save[ds]?|"
+                r"open|scratch|draft|storage|size)\b"),
+     frozenset({"list_directory", "read_file", "search_files", "search_file_contents",
+                "file_info", "directory_size", "write_file", "list_scratch_files",
+                "delete_scratch_file", "open_path", "run_command"})),
+    (re.compile(r"\b(note|notes|remind|reminder|reminders|remember|forget|memory|"
+                r"recall|fact|facts|know about|told you|cancel)\b"),
+     frozenset({"take_note", "list_notes", "delete_note", "set_reminder",
+                "list_reminders", "cancel_reminder", "list_facts", "forget_fact"})),
+    (re.compile(r"\b(day|days|date|dates|week|weeks|month|months|year|years|"
+                r"until|since|birthday|christmas|calendar|when|long)\b"),
+     frozenset({"days_between", "shift_date", "get_datetime"})),
+    (re.compile(r"\b(hash|digest|sha|sha1|sha256|sha512|md5|checksum)\b"),
+     frozenset({"hash_text"})),
+    (re.compile(r"\b(random|randomly|dice|die|roll|coin|flip|pick|choose|choice|"
+                r"shuffle|draw|decide)\b"),
+     frozenset({"pick_random"})),
+    (re.compile(r"\b(cpu|memory|ram|disk|battery|process|processes|load|uptime|"
+                r"network|machine|laptop|computer|performance|slow|hot)\b"),
+     frozenset({"system_status", "list_processes"})),
+    (re.compile(r"\b(clipboard|copy|copied|paste|pasted)\b"),
+     frozenset({"clipboard_read", "clipboard_write"})),
+    (re.compile(r"\b(weather|forecast|temperature|rain|raining|sunny|snow|wind)\b"),
+     frozenset({"get_weather"})),
+    (re.compile(r"\b(web|search|google|look up|news|latest|current|online|url|"
+                r"link|website|page|fetch)\b"),
+     frozenset({"web_search", "fetch_url"})),
+    (re.compile(r"\b(word|words|count|characters|text|passage|reading time|"
+                r"summar\w+|paragraph)\b"),
+     frozenset({"text_stats"})),
+    # Anything the operator calls theirs is about their machine or their
+    # material, so both clusters come along. Cheap insurance against a
+    # possessive phrasing that names no noun the patterns above know.
+    (re.compile(r"\b(my|mine|our)\b"),
+     frozenset({"list_directory", "read_file", "search_files", "search_file_contents",
+                "file_info", "directory_size", "list_scratch_files",
+                "take_note", "list_notes", "set_reminder", "list_reminders",
+                "list_facts", "forget_fact"})),
+]
+
+
 # ------------------------------------------------------------------- the skills
 
 
@@ -571,6 +804,21 @@ class SkillKit:
             self.recall,
         ))
         self.add(Skill(
+            "list_facts",
+            "List everything stored about the user. Use this for 'what do you know about me' "
+            "and before correcting or removing a fact, so you know its exact key.",
+            _obj(limit={"type": "integer", "description": "how many, default 30"}),
+            self.list_facts,
+        ))
+        self.add(Skill(
+            "forget_fact",
+            "Delete one stored fact by its key, when it is wrong or out of date. "
+            "Call list_facts first if you are unsure of the key.",
+            _obj(key={"type": "string",
+                      "description": "the key it was stored under", "_required": True}),
+            self.forget_fact,
+        ))
+        self.add(Skill(
             "take_note",
             "Save a free-form note for the user to read later.",
             _obj(
@@ -584,6 +832,12 @@ class SkillKit:
             "List the most recent saved notes.",
             _obj(limit={"type": "integer", "description": "how many, default 10"}),
             self.list_notes,
+        ))
+        self.add(Skill(
+            "delete_note",
+            "Delete a saved note by its id, as shown by list_notes.",
+            _obj(note_id={"type": "integer", "description": "the note's id", "_required": True}),
+            self.delete_note,
         ))
         self.add(Skill(
             "set_reminder",
@@ -600,6 +854,44 @@ class SkillKit:
             "List reminders that have not fired yet.",
             _obj(),
             self.list_reminders,
+        ))
+        self.add(Skill(
+            "cancel_reminder",
+            "Call off a pending reminder by its id, as shown by list_reminders.",
+            _obj(reminder_id={"type": "integer",
+                              "description": "the reminder's id", "_required": True}),
+            self.cancel_reminder,
+        ))
+        self.add(Skill(
+            "days_between",
+            "Count the days from one date to another. Use this for anything involving how "
+            "long until or since something - date arithmetic, leap years and weekday names "
+            "are not things you can work out reliably in your head. For 'how many days until "
+            "X', pass X as 'end' and leave 'start' out; it defaults to today. Never pass the "
+            "same date as both. Accepts '2026-12-25', '25 December', 'tomorrow', "
+            "'next friday', 'in 10 days'.",
+            _obj(
+                end={"type": "string",
+                     "description": "the date being counted to, e.g. '25 December'",
+                     "_required": True},
+                start={"type": "string",
+                       "description": "the date being counted from; omit for today"},
+            ),
+            self.days_between,
+        ))
+        self.add(Skill(
+            "shift_date",
+            "Work out the date a given distance from another date, and which weekday it "
+            "falls on. Months and years move by the calendar, so 31 January plus one month "
+            "is 28 February.",
+            _obj(
+                date={"type": "string", "description": "the starting date, default today"},
+                days={"type": "integer", "description": "days to add (negative to subtract)"},
+                weeks={"type": "integer", "description": "weeks to add"},
+                months={"type": "integer", "description": "whole months to add"},
+                years={"type": "integer", "description": "whole years to add"},
+            ),
+            self.shift_date,
         ))
         self.add(Skill(
             "convert_units",
@@ -619,6 +911,17 @@ class SkillKit:
             "and report its most frequent significant words.",
             _obj(text={"type": "string", "description": "the passage", "_required": True}),
             self.text_stats,
+        ))
+        self.add(Skill(
+            "hash_text",
+            "Compute a cryptographic digest (md5, sha1, sha256, sha512) of a string. "
+            "Use this whenever a hash is asked for - you cannot calculate one yourself.",
+            _obj(
+                text={"type": "string", "description": "the text to digest", "_required": True},
+                algorithm={"type": "string", "enum": ["md5", "sha1", "sha256", "sha512"],
+                           "description": "default sha256"},
+            ),
+            self.hash_text,
         ))
         self.add(Skill(
             "pick_random",
@@ -672,6 +975,28 @@ class SkillKit:
             danger="reads_files",
         ))
         self.add(Skill(
+            "search_file_contents",
+            "Search *inside* files for a piece of text and return the matching lines with "
+            "their file and line number. This is the one to use for 'where did I write X' - "
+            "search_files only matches file names.",
+            _obj(
+                query={"type": "string", "description": "the text to look for", "_required": True},
+                path={"type": "string", "description": "directory to search from"},
+                pattern={"type": "string", "description": "narrow to a glob such as '*.py'"},
+                limit={"type": "integer", "description": "max matching lines, default 40"},
+            ),
+            self.search_file_contents,
+            danger="reads_files",
+        ))
+        self.add(Skill(
+            "file_info",
+            "Report a file or folder's size, when it was last modified, and how many lines "
+            "or entries it holds - without reading the whole thing.",
+            _obj(path={"type": "string", "description": "the path", "_required": True}),
+            self.file_info,
+            danger="reads_files",
+        ))
+        self.add(Skill(
             "directory_size",
             "Measure how much disk a folder is using, and which of its children are the "
             "largest. Use this when the user asks what is taking up space.",
@@ -694,6 +1019,16 @@ class SkillKit:
             danger="writes_files",
         ))
         self.add(Skill(
+            "delete_scratch_file",
+            "Delete a file the assistant previously wrote to its own scratch folder. "
+            "It cannot touch any of the user's own files.",
+            _obj(filename={"type": "string",
+                           "description": "the name as shown by list_scratch_files",
+                           "_required": True}),
+            self.delete_scratch_file,
+            danger="writes_files",
+        ))
+        self.add(Skill(
             "list_scratch_files",
             "List the files the assistant has written to its own scratch folder.",
             _obj(),
@@ -701,6 +1036,31 @@ class SkillKit:
             danger="reads_files",
         ))
         if self.allow_shell:
+            self.add(Skill(
+                "clipboard_write",
+                "Put text on the system clipboard so the user can paste it.",
+                _obj(text={"type": "string",
+                           "description": "the text to copy", "_required": True}),
+                self.clipboard_write,
+                danger="executes",
+            ))
+            self.add(Skill(
+                "clipboard_read",
+                "Read what is currently on the system clipboard. Use it when the user says "
+                "something like 'what did I just copy' or asks you to work on what they copied.",
+                _obj(),
+                self.clipboard_read,
+                danger="executes",
+            ))
+            self.add(Skill(
+                "open_path",
+                "Open a file or folder inside the permitted workspace in whichever "
+                "application handles it. Filesystem paths only, not URLs.",
+                _obj(path={"type": "string",
+                           "description": "the file or folder to open", "_required": True}),
+                self.open_path,
+                danger="executes",
+            ))
             self.add(Skill(
                 "run_command",
                 "Run one read-only shell command from an allow-list "
@@ -741,8 +1101,47 @@ class SkillKit:
 
     # -- introspection --------------------------------------------------------
 
-    def schemas(self) -> list[dict[str, Any]]:
-        return [s.schema() for s in self.skills.values()]
+    def schemas(self, for_text: str | None = None) -> list[dict[str, Any]]:
+        """Tool schemas to attach to a request.
+
+        With `for_text`, only the clusters that directive could plausibly need.
+
+        Measured on this project: attaching all 29 skills costs ~3,500 prompt
+        tokens and **1.3 seconds of time-to-first-token on every directive**,
+        whether or not a tool is called - the model re-reads the whole prompt
+        before answering. Tools off: 632 tokens, 1.69s. Tools on: 4,176 tokens,
+        3.01s. That is a permanent tax for capability that is idle almost
+        always, and it grows with every skill added.
+
+        So the same cheap deterministic pre-flight the reflex arc uses is
+        applied here: a directive that says nothing about files does not need
+        the file tools described to it. The core set rides along regardless,
+        because those apply to almost anything, and an unrecognised directive
+        gets everything rather than being quietly under-equipped.
+        """
+        if not for_text:
+            return [s.schema() for s in self.skills.values()]
+        wanted = self.relevant(for_text)
+        return [s.schema() for name, s in self.skills.items() if name in wanted]
+
+    def relevant(self, text: str) -> set[str]:
+        """Names of the skills worth describing for this directive."""
+        lowered = f" {text.lower()} "
+        keep = set(_CORE_SKILLS)
+        matched = False
+        for pattern, group in _SKILL_GROUPS:
+            if pattern.search(lowered):
+                keep |= group
+                matched = True
+        if not matched:
+            # Nothing in the directive touches a cluster - "what is the capital
+            # of Japan" needs no tool at all. This is the *common* case, and it
+            # was the most expensive one: sending all 29 schemas measured 15s to
+            # first token against 4.8s for a gated seven. The core still rides
+            # along, so the model can still check the date, do exact
+            # arithmetic, or search what was said before.
+            pass
+        return {name for name in keep if name in self.skills}
 
     def catalogue(self) -> list[dict[str, Any]]:
         return [
@@ -826,6 +1225,36 @@ class SkillKit:
             "found": bool(fact or hits),
         }
 
+    def list_facts(self, limit: int = 30) -> dict[str, Any]:
+        """Everything stored about the user, without needing a search term.
+
+        `recall` can only answer a question you already know how to ask. This
+        is the one for "what do you actually know about me?", which is both a
+        fair question and the only way to find a fact worth correcting.
+        """
+        facts = self.memory.all_facts(max(1, min(200, int(limit))))
+        return {"count": len(facts), "facts": facts}
+
+    def forget_fact(self, key: str) -> dict[str, Any]:
+        """Remove one stored fact.
+
+        Until now the store could only be added to, or erased entirely. A fact
+        that has simply gone out of date - a job, a preference, an address -
+        left the operator choosing between living with it and wiping
+        everything, which is not a choice anyone should have to make.
+        """
+        name = (key or "").strip()
+        if not name:
+            raise SkillError("which fact? give the key it was stored under")
+        removed = self.memory.forget_fact(name)
+        if not removed:
+            known = [f["key"] for f in self.memory.all_facts(60)]
+            raise SkillError(
+                f"nothing is stored under '{name}'"
+                + (f" - I have: {', '.join(known[:12])}" if known else "")
+            )
+        return {"forgotten": name.strip().lower()}
+
     def take_note(self, text: str, tags: str = "") -> dict[str, Any]:
         note_id = self.memory.add_note(text, tags)
         return {"note_id": note_id, "saved": text[:200]}
@@ -833,6 +1262,16 @@ class SkillKit:
     def list_notes(self, limit: int = 10) -> dict[str, Any]:
         notes = self.memory.list_notes(max(1, min(50, int(limit))))
         return {"count": len(notes), "notes": notes}
+
+    def delete_note(self, note_id: int) -> dict[str, Any]:
+        """Discard a note by its id, as listed by `list_notes`."""
+        try:
+            ident = int(note_id)
+        except (TypeError, ValueError) as exc:
+            raise SkillError("a numeric note id is required - list_notes shows them") from exc
+        if not self.memory.delete_note(ident):
+            raise SkillError(f"there is no note {ident}")
+        return {"deleted_note": ident}
 
     def set_reminder(self, text: str, when: str) -> dict[str, Any]:
         target = parse_when(when)
@@ -853,6 +1292,71 @@ class SkillKit:
         for item in pending:
             item["due"] = datetime.fromtimestamp(item["due_ts"]).strftime("%a %-I:%M %p")
         return {"count": len(pending), "reminders": pending}
+
+    def cancel_reminder(self, reminder_id: int) -> dict[str, Any]:
+        """Call off a reminder that has not fired yet."""
+        try:
+            ident = int(reminder_id)
+        except (TypeError, ValueError) as exc:
+            raise SkillError(
+                "a numeric reminder id is required - list_reminders shows them"
+            ) from exc
+        if not self.memory.cancel_reminder(ident):
+            raise SkillError(f"there is no pending reminder {ident}")
+        return {"cancelled_reminder": ident}
+
+    def _date(self, raw: str, label: str) -> datetime:
+        parsed = parse_date(raw)
+        if parsed is None:
+            raise SkillError(
+                f"I could not read {label} from '{raw}'. Try YYYY-MM-DD, "
+                "'25 December', 'tomorrow' or 'in 10 days'."
+            )
+        return parsed
+
+    def days_between(self, end: str = "today", start: str = "today") -> dict[str, Any]:
+        """Calendar distance between two dates.
+
+        Date arithmetic is one of the things a language model gets confidently
+        wrong - leap years, month lengths and weekday names are all memorised
+        rather than computed. This computes them.
+        """
+        first = self._date(start or "today", "the start date")
+        second = self._date(end or "today", "the end date")
+        days = (second - first).days
+        return {
+            "start": first.strftime("%Y-%m-%d"),
+            "start_weekday": first.strftime("%A"),
+            "end": second.strftime("%Y-%m-%d"),
+            "end_weekday": second.strftime("%A"),
+            "days": days,
+            "weeks": round(days / 7, 2),
+            "direction": "future" if days > 0 else ("past" if days < 0 else "same day"),
+            "spoken": (
+                "the same day" if days == 0
+                else f"{abs(days)} day{'s' if abs(days) != 1 else ''} "
+                     f"{'after' if days > 0 else 'before'}"
+            ),
+        }
+
+    def shift_date(self, date: str = "today", days: int = 0, weeks: int = 0,
+                   months: int = 0, years: int = 0) -> dict[str, Any]:
+        """The date a given distance from another date.
+
+        Months and years move by the calendar, clamping the day to the target
+        month's length - 31 January plus one month is 28 February, not 3 March.
+        """
+        base = self._date(date or "today", "the date")
+        moved = base + timedelta(days=int(days or 0), weeks=int(weeks or 0))
+        if months or years:
+            moved = _add_months(moved, int(months or 0) + int(years or 0) * 12)
+        return {
+            "from": base.strftime("%Y-%m-%d"),
+            "result": moved.strftime("%Y-%m-%d"),
+            "weekday": moved.strftime("%A"),
+            "spoken": moved.strftime("%A, %-d %B %Y"),
+            "days_moved": (moved - base).days,
+        }
 
     def convert_units(self, value: float, from_unit: str, to_unit: str) -> dict[str, Any]:
         result, dimension, _ = convert(float(value), from_unit, to_unit)
@@ -889,6 +1393,24 @@ class SkillKit:
             "speaking_time_min": round(len(words) / 150.0, 1),
             "longest_word": max(words, key=len) if words else "",
             "top_words": [{"word": w, "count": c} for w, c in top],
+        }
+
+    def hash_text(self, text: str, algorithm: str = "sha256") -> dict[str, Any]:
+        """Digest a string. A language model cannot compute one and will
+        cheerfully invent a plausible-looking hex string if asked."""
+        name = (algorithm or "sha256").strip().lower().replace("-", "")
+        allowed = {"md5", "sha1", "sha256", "sha512"}
+        if name not in allowed:
+            raise SkillError(f"algorithm must be one of {', '.join(sorted(allowed))}")
+        raw = str(text).encode("utf-8")
+        digest = hashlib.new(name, raw).hexdigest()
+        return {
+            "algorithm": name,
+            "input_bytes": len(raw),
+            "hex": digest,
+            # Spoken aloud, sixty-four hex characters is noise; the first eight
+            # are what anyone actually compares.
+            "short": digest[:8],
         }
 
     def pick_random(self, options: list[str] | None = None, minimum: int | None = None,
@@ -1021,6 +1543,22 @@ class SkillKit:
                             .strftime("%Y-%m-%d %H:%M")})
         return {"path": str(root), "count": len(entries), "files": entries[:60]}
 
+    def delete_scratch_file(self, filename: str) -> dict[str, Any]:
+        """Remove a file the assistant itself wrote.
+
+        Confined to the scratch directory by the same resolver `write_file`
+        uses, so this can only ever undo the assistant's own work - it has no
+        reach into anything the operator created.
+        """
+        target = _resolve_scratch(filename)
+        if not target.exists():
+            raise SkillError(f"'{target.name}' is not in the scratch folder")
+        if not target.is_file():
+            raise SkillError("that is a folder, not a file")
+        size = target.stat().st_size
+        target.unlink()
+        return {"deleted": str(target), "bytes": size, "size": _human_bytes(size)}
+
     def list_directory(self, path: str = ".") -> dict[str, Any]:
         target = _resolve_path(path or ".")
         if not target.is_dir():
@@ -1053,6 +1591,110 @@ class SkillKit:
                 lines.append(line.rstrip("\n")[:400])
         return {"path": str(target), "lines": len(lines), "content": "\n".join(lines)}
 
+    def search_file_contents(self, query: str, path: str = ".", pattern: str = "*",
+                             limit: int = 40) -> dict[str, Any]:
+        """Grep the workspace. `search_files` only ever matched *names*.
+
+        Sibling to `search_files`, and the one people actually mean when they
+        ask where they wrote something. Confined by the same `_resolve_path`
+        guard, skips dotted paths and anything that is not text, and caps both
+        the files opened and the matches returned so a query against a home
+        directory cannot walk for a minute.
+        """
+        root = _resolve_path(path or ".")
+        if not root.is_dir():
+            raise SkillError(f"'{root}' is not a directory")
+        needle = (query or "").strip()
+        if not needle:
+            raise SkillError("a search string is required")
+        wanted = max(1, min(200, int(limit)))
+        lowered = needle.lower()
+
+        matches: list[dict[str, Any]] = []
+        scanned = 0
+        truncated = False
+        for candidate in sorted(root.rglob(pattern or "*")):
+            if len(matches) >= wanted or scanned >= 4000:
+                truncated = True
+                break
+            if not candidate.is_file():
+                continue
+            if any(part.startswith(".") for part in candidate.relative_to(root).parts):
+                continue
+            if candidate.suffix.lower() not in _TEXT_SUFFIXES:
+                continue
+            try:
+                if candidate.stat().st_size > 2_000_000:
+                    continue
+            except OSError:
+                continue
+            scanned += 1
+            try:
+                with candidate.open("r", encoding="utf-8", errors="replace") as handle:
+                    for number, line in enumerate(handle, 1):
+                        if lowered not in line.lower():
+                            continue
+                        matches.append({
+                            "path": str(candidate),
+                            "line": number,
+                            "text": line.strip()[:240],
+                        })
+                        if len(matches) >= wanted:
+                            truncated = True
+                            break
+            except OSError:
+                continue
+
+        return {
+            "root": str(root),
+            "query": needle,
+            "files_scanned": scanned,
+            "count": len(matches),
+            "truncated": truncated,
+            "matches": matches,
+        }
+
+    def file_info(self, path: str) -> dict[str, Any]:
+        """Size, age and shape of a path, without reading it all in."""
+        target = _resolve_path(path)
+        if not target.exists():
+            raise SkillError(f"'{target}' does not exist")
+        try:
+            stat = target.stat()
+        except OSError as exc:
+            raise SkillError(f"could not read '{target}': {exc.strerror or exc}") from exc
+
+        info: dict[str, Any] = {
+            "path": str(target),
+            "name": target.name,
+            "type": "dir" if target.is_dir() else "file",
+            "bytes": stat.st_size,
+            "size": _human_bytes(stat.st_size),
+            "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+            "modified_ago_days": round((time.time() - stat.st_mtime) / 86400, 1),
+        }
+        if target.is_dir():
+            try:
+                children = list(target.iterdir())
+            except OSError:
+                children = []
+            info["entries"] = len(children)
+            info["files"] = sum(1 for c in children if c.is_file())
+            info["folders"] = sum(1 for c in children if c.is_dir())
+            return info
+
+        info["suffix"] = target.suffix
+        info["text"] = target.suffix.lower() in _TEXT_SUFFIXES
+        # Line count only for text, and only when it is cheap enough to be
+        # worth doing at all - the point of this skill is to avoid reading.
+        if info["text"] and stat.st_size <= 4_000_000:
+            try:
+                with target.open("r", encoding="utf-8", errors="replace") as handle:
+                    info["lines"] = sum(1 for _ in handle)
+            except OSError:
+                pass
+        return info
+
     def search_files(self, pattern: str, path: str = ".") -> dict[str, Any]:
         root = _resolve_path(path or ".")
         if not root.is_dir():
@@ -1066,6 +1708,89 @@ class SkillKit:
             if len(found) >= 60:
                 break
         return {"root": str(root), "pattern": safe_pattern, "count": len(found), "paths": found}
+
+    # -- desktop integration --------------------------------------------------
+    #
+    # These spawn a process, so they sit behind the same JARVIS_ALLOW_SHELL
+    # flag as `run_command` rather than inventing a second, weaker gate. Each
+    # one is argv-form with no shell, so nothing here can be turned into a
+    # command by the contents of its argument.
+
+    def _require_desktop(self, tool: str) -> str:
+        if not self.allow_shell:
+            raise SkillError(
+                "desktop integration is disabled (set JARVIS_ALLOW_SHELL=1 to enable)"
+            )
+        if platform.system() != "Darwin":
+            raise SkillError(f"'{tool}' is macOS-only and this is {platform.system()}")
+        found = shutil.which(tool)
+        if found is None:
+            raise SkillError(f"'{tool}' is not available on this machine")
+        return found
+
+    def clipboard_write(self, text: str) -> dict[str, Any]:
+        """Put text on the system clipboard, ready to paste."""
+        tool = self._require_desktop("pbcopy")
+        body = str(text)
+        if len(body) > 200_000:
+            raise SkillError("that is too much text for one clipboard write (200 KB limit)")
+        try:
+            subprocess.run(  # noqa: S603 - argv form, fixed binary, no shell
+                [tool], input=body.encode("utf-8"), timeout=5, check=True,
+            )
+        except subprocess.SubprocessError as exc:
+            raise SkillError(f"could not write the clipboard: {exc}") from exc
+        return {"copied_characters": len(body), "preview": body[:120]}
+
+    def clipboard_read(self) -> dict[str, Any]:
+        """Read whatever is on the system clipboard.
+
+        Worth being deliberate about: a clipboard very often holds the last
+        password someone copied. It is gated, it is never read unless the
+        operator asked for it, and the result goes into the model's context
+        like any other tool output - so this is enabled by the same explicit
+        opt-in as shell access, not on by default.
+        """
+        tool = self._require_desktop("pbpaste")
+        try:
+            proc = subprocess.run(  # noqa: S603 - argv form, fixed binary, no shell
+                [tool], capture_output=True, timeout=5, check=True,
+            )
+        except subprocess.SubprocessError as exc:
+            raise SkillError(f"could not read the clipboard: {exc}") from exc
+        body = proc.stdout.decode("utf-8", errors="replace")
+        truncated = len(body) > 20_000
+        return {
+            "characters": len(body),
+            "truncated": truncated,
+            "text": body[:20_000],
+            "empty": not body.strip(),
+        }
+
+    def open_path(self, path: str) -> dict[str, Any]:
+        """Open a file or folder in whatever application handles it.
+
+        Filesystem paths only, and only inside the permitted workspace. URLs
+        are deliberately not accepted: handing one to the browser would reach
+        the network without passing the egress guard that every other outbound
+        request in this file has to satisfy.
+        """
+        tool = self._require_desktop("open")
+        raw = (path or "").strip()
+        if re.match(r"^[a-z][a-z0-9+.-]*:", raw, re.I):
+            raise SkillError(
+                "only filesystem paths can be opened, not URLs or other schemes"
+            )
+        target = _resolve_path(raw)
+        if not target.exists():
+            raise SkillError(f"'{target}' does not exist")
+        try:
+            subprocess.run(  # noqa: S603 - argv form, fixed binary, no shell
+                [tool, str(target)], capture_output=True, timeout=10, check=True,
+            )
+        except subprocess.SubprocessError as exc:
+            raise SkillError(f"could not open it: {exc}") from exc
+        return {"opened": str(target), "type": "dir" if target.is_dir() else "file"}
 
     def run_command(self, command: str) -> dict[str, Any]:
         if not self.allow_shell:

@@ -34,10 +34,12 @@ of this project is to run lean on a laptop.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import json
 import platform
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -55,10 +57,20 @@ if TYPE_CHECKING:
     from ..registry import Registry
 
 #: The invariant half of the persona prompt: grounding the model cannot infer.
+#:
+#: `today` is deliberately day-resolution, not the minute. Ollama reuses the
+#: KV cache only for the longest *common prefix*, and this is message zero - so
+#: a clock that ticks in the system prompt invalidates everything behind it,
+#: including ~3,000 tokens of tool schema, on every turn that crosses a minute
+#: boundary. Measured at roughly 0.8s of extra prompt evaluation per turn, paid
+#: for a figure that is stale a minute later anyway. The exact time still
+#: reaches the model whenever it matters, from the reflex arc and the
+#: `get_datetime` skill, both of which are accurate to the second.
 JARVIS_SYSTEM = (
     "You are {name}, a locally hosted AI assistant, speaking directly to {operator}. "
-    "The current date and time is {now}, and you are running on {host}. Use these when asked - "
-    "you genuinely do know them. "
+    "Today is {today}, and you are running on {host}. Use these when asked - "
+    "you genuinely do know them. For the time of day, consult your tools rather "
+    "than assuming. "
     "Your replies are converted to speech, so write plain spoken prose: no markdown, no bullet "
     "points, no code blocks, no emoji, no stage directions. {style} "
     "Never mention that you are a language model. If you do not know something, say so "
@@ -71,10 +83,13 @@ JARVIS_SYSTEM = (
 #: a failure, is what actually moves the model to emit a tool call.
 _TOOL_HINT = (
     " You have tools. You MUST call a tool instead of answering from memory whenever the "
-    "question depends on: the current date or time; live machine state; arithmetic on numbers "
-    "longer than two digits; the contents of the operator's files; or anything said in an "
-    "earlier conversation. Guessing at any of these is a failure. Call the tool first, then "
-    "answer in plain spoken prose using the result, without mentioning the mechanics."
+    "question depends on: the current date or time; how many days lie between two dates, or "
+    "what date falls a given distance from another; live machine state; arithmetic on numbers "
+    "longer than two digits; a cryptographic digest; a genuinely random choice; the contents "
+    "of the operator's files; or anything said in an earlier conversation. Guessing at any of "
+    "these is a failure - each one is something you cannot actually compute, however confident "
+    "the answer feels. Call the tool first, then answer in plain spoken prose using the "
+    "result, copying any value it returns exactly as given."
 )
 
 _SYSTEM_TMPL = (
@@ -133,9 +148,13 @@ def _http_json(url: str, payload: dict | None = None, timeout: float = 5.0) -> A
 class StreamEvent:
     """One decoded frame from Ollama's streaming chat endpoint."""
 
-    kind: str  # "delta" | "think" | "tools"
+    kind: str  # "delta" | "think" | "tools" | "done"
     text: str = ""
     tool_calls: list[dict] = field(default_factory=list)
+    #: only on the final "done" frame
+    prompt_tokens: int = 0
+    eval_tokens: int = 0
+    done_reason: str = ""
 
 
 def _stream_chat(url: str, payload: dict) -> Iterator[StreamEvent]:
@@ -167,6 +186,16 @@ def _stream_chat(url: str, payload: dict) -> Iterator[StreamEvent]:
             if delta:
                 yield StreamEvent("delta", delta)
             if event.get("done"):
+                # The final frame carries the accounting. It is the only place
+                # two silent failures are visible: an answer cut off because it
+                # hit the token ceiling, and a prompt so large that Ollama
+                # quietly dropped the oldest messages to make it fit.
+                yield StreamEvent(
+                    "done",
+                    prompt_tokens=int(event.get("prompt_eval_count") or 0),
+                    eval_tokens=int(event.get("eval_count") or 0),
+                    done_reason=str(event.get("done_reason") or ""),
+                )
                 return
 
 
@@ -229,6 +258,12 @@ class Turn:
     answer: str = ""
     tool_calls: list[dict] = field(default_factory=list)
     chars: int = 0
+    #: the operator interrupted; whatever is above is a half-finished thought
+    aborted: bool = False
+    #: accounting from the final stream frame, for the truncation warnings
+    prompt_tokens: int = 0
+    eval_tokens: int = 0
+    done_reason: str = ""
 
 
 class OllamaRuntime:
@@ -253,10 +288,22 @@ class OllamaRuntime:
         self.on_reset: Callable[[], None] | None = None
         #: called as (name, arguments, result) for every executed tool
         self.on_tool: Callable[[str, dict, dict], None] | None = None
+        #: called as (prompt_tokens, eval_tokens) once Ollama reports them
+        self.on_usage: Callable[[int, int], None] | None = None
         #: extra grounding injected ahead of the user turn (durable recall)
         self.context_provider: Callable[[str], str] | None = None
         #: latest host metrics, so reflexes can ground live-state questions
         self.vitals_provider: Callable[[], dict] | None = None
+        #: raised to cut a generation short. Set from the event loop, read by
+        #: the worker thread between tokens - which is why it is an Event and
+        #: not a plain bool.
+        self._abort = threading.Event()
+        #: monotonic stamp of the last directive, for the idle context reset
+        self._last_turn_at: float = 0.0
+        #: cached token cost of the tool schemas - they do not change between
+        #: model switches, and re-serialising 29 of them per turn to measure
+        #: something constant would be its own small waste
+        self._tool_tokens: int | None = None
 
     @property
     def model(self) -> str:
@@ -307,6 +354,63 @@ class OllamaRuntime:
     def clear_memory(self) -> None:
         self.memory.clear()
 
+    def shed_style(self) -> int:
+        """Drop our own past replies from the working context.
+
+        Called when the disposition changes. The persona lives in the system
+        prompt, but the conversation behind it still holds several turns spoken
+        in the *old* voice, and a model imitates its own recent output far more
+        readily than it follows an instruction: switching back to the butler
+        after a few furious turns produced a butler who told the operator to
+        pull themselves together.
+
+        The operator's turns stay, so the thread of the conversation survives -
+        it is only the assistant's own delivery that is forgotten. Same
+        principle as durable recall: our past output is not evidence, and
+        re-reading it is how a style, or a mistake, becomes permanent.
+        """
+        before = len(self.memory)
+        self.memory[:] = [m for m in self.memory if m.get("role") != "assistant"]
+        return before - len(self.memory)
+
+    def abort(self) -> None:
+        """Stop generating: the operator is talking again.
+
+        Ollama has no cancel, so this is cooperative - the consumer thread
+        notices between tokens and closes the response, which is what actually
+        frees the model. Without it a barge-in silences the voice but leaves
+        the whole answer being written anyway, and the directive the operator
+        interrupted with waits out a reply nobody will ever hear.
+        """
+        self._abort.set()
+
+    @staticmethod
+    def _tokens(text: str) -> int:
+        """Rough token count. Four characters per token, as used for tok/s."""
+        return max(1, len(text) // 4)
+
+    def _tool_token_cost(self) -> int:
+        """What the tool schemas cost in the prompt, every single request."""
+        if not self.tools_enabled or self.kit is None:
+            return 0
+        if self._tool_tokens is None:
+            self._tool_tokens = self._tokens(json.dumps(self.kit.schemas()))
+        return self._tool_tokens
+
+    def _context_budget(self) -> int:
+        """How many tokens of conversation still fit, after everything fixed.
+
+        Trimming by *turn count* was the wrong unit: eight turns of "yes" and
+        eight turns of a three-hundred-word explanation are the same number and
+        wildly different prompts. What actually costs time is tokens - the
+        model re-reads the whole prompt before emitting anything, so time to
+        first token grows with the context whether or not it is being used.
+        """
+        if settings.num_ctx <= 0:
+            return 0  # server default in force; not ours to second-guess
+        room = settings.num_ctx - self._tool_token_cost() - settings.context_reserve_tokens
+        return max(512, room)
+
     def _remember(self, role: str, content: str) -> None:
         if not content:
             return
@@ -314,6 +418,22 @@ class OllamaRuntime:
         limit = max(2, settings.memory_turns * 2)
         if len(self.memory) > limit:
             del self.memory[: len(self.memory) - limit]
+
+        # ...and then again by size, because that is what is actually scarce.
+        budget = self._context_budget()
+        if budget <= 0:
+            return
+        used = sum(self._tokens(m.get("content", "")) for m in self.memory)
+        dropped = 0
+        while used > budget and len(self.memory) > 2:
+            used -= self._tokens(self.memory.pop(0).get("content", ""))
+            dropped += 1
+        if dropped:
+            self.bus.publish(
+                "info", "memory",
+                f"context trimmed - dropped {dropped} old turn(s) to stay within "
+                f"{budget} tokens (every turn re-reads the whole prompt)",
+            )
 
     def _fire(self, node: str, intensity: float = 1.0) -> None:
         if self.neural is not None:
@@ -400,8 +520,28 @@ class OllamaRuntime:
     # -- Runtime API -------------------------------------------------------------
 
     async def run(self, text: str) -> str:
+        # Ageing out a stale context comes first: it is true regardless of
+        # whether this particular directive can be answered.
+        # A conversation nobody has touched for a quarter of an hour is over.
+        # Carrying it forward costs prompt-evaluation time on every turn of the
+        # next one, for context the operator has long since stopped meaning.
+        now = time.monotonic()
+        idle = settings.context_idle_reset_s
+        if self.memory and idle > 0 and self._last_turn_at and now - self._last_turn_at > idle:
+            gap = int((now - self._last_turn_at) / 60)
+            self.bus.publish(
+                "info", "memory",
+                f"starting fresh - {gap} minute(s) since the last directive "
+                f"({len(self.memory)} turn(s) released)",
+            )
+            self.memory.clear()
+        self._last_turn_at = now
+
         if not self.model:
             return "No language model is installed. Pull one with ollama pull, then ask me again."
+        # Any interrupt that arrived before this directive existed was aimed at
+        # the previous one.
+        self._abort.clear()
         mode = self.mode
         if mode == "crewai":
             try:
@@ -416,6 +556,12 @@ class OllamaRuntime:
             mode = "crew"
 
         answer = await (self._run_crew(text) if mode == "crew" else self._run_fast(text))
+        if self._abort.is_set():
+            # A half-written answer to a question the operator moved on from is
+            # worse than no answer: remembering it would have the model carry
+            # the abandoned thread into everything that follows.
+            self.bus.publish("warn", "agent/jarvis", "generation interrupted by the operator")
+            return ""
         self._remember("user", text)
         self._remember("assistant", answer)
         return answer
@@ -428,7 +574,7 @@ class OllamaRuntime:
         prompt = JARVIS_SYSTEM.format(
             name=settings.name,
             operator=settings.operator,
-            now=datetime.now().strftime("%A, %d %B %Y, %H:%M"),
+            today=datetime.now().strftime("%A, %d %B %Y"),
             host=f"{platform.system()} {platform.machine()}",
             style=persona.style,
         )
@@ -468,13 +614,17 @@ class OllamaRuntime:
         messages.extend(self.memory)
         messages.append({"role": "user", "content": text})
 
-        tools = self.kit.schemas() if self.tools_enabled else None
+        # Only the tools this directive could plausibly need. Describing all of
+        # them costs ~1.3s of time-to-first-token every single time, used or
+        # not, because the model reads the whole prompt before answering.
+        tools = self.kit.schemas(text) if self.tools_enabled else None
+        total = len(self.kit.skills) if self.kit is not None else 0
         self.bus.publish(
             "info",
             "agent/jarvis",
             f"reasoning with {self.model}…"
             + (" [thinking]" if self.think else "")
-            + (f" [{len(tools)} tools]" if tools else ""),
+            + (f" [{len(tools)} of {total} tools]" if tools else ""),
         )
 
         answer = ""
@@ -493,6 +643,8 @@ class OllamaRuntime:
             self._fire("cortex.jarvis", 1.0)
             turn = await asyncio.to_thread(self._consume, "jarvis", payload, True, self.on_delta)
 
+            if turn.aborted:
+                return ""
             if not turn.tool_calls:
                 answer = strip_think(turn.answer)
                 break
@@ -508,6 +660,8 @@ class OllamaRuntime:
                 "tool_calls": turn.tool_calls,
             })
             await self._execute_tools(turn.tool_calls, messages)
+            if self._abort.is_set():
+                return ""
 
             if round_index == rounds - 1:
                 self.bus.publish("warn", "agent/tools", "tool round limit reached - composing now")
@@ -568,6 +722,8 @@ class OllamaRuntime:
     async def _run_crew(self, text: str) -> str:
         self._fire("intake.route", 1.0)
         plan = await self._persona_step(AgentPersonas.ROUTER, text)
+        if self._abort.is_set():
+            return ""
         findings: list[str] = []
 
         self._fire("cortex.analyst", 1.0)
@@ -576,6 +732,8 @@ class OllamaRuntime:
             f"Command: {text}\nRouter plan:\n{plan}\nProduce key findings (max 5 bullets, plain text).",
         )
         findings.append(analyst_out)
+        if self._abort.is_set():
+            return ""
 
         self._fire("cortex.engineer", 1.0)
         engineer_out = await self._persona_step(
@@ -585,6 +743,8 @@ class OllamaRuntime:
             "If no execution is needed, say 'no tooling required'.",
         )
         findings.append(engineer_out)
+        if self._abort.is_set():
+            return ""
 
         self.bus.publish("info", "agent/synth", "composing final spoken answer")
         self._fire("cortex.synth", 1.0)
@@ -594,6 +754,8 @@ class OllamaRuntime:
             log_sentences=False,
             on_delta=self.on_delta,
         )
+        if self._abort.is_set():
+            return ""
         return strip_think(answer) or "I am afraid I could not compose a response."
 
     async def _persona_step(self, persona: Persona, prompt: str, log_sentences: bool = True,
@@ -613,6 +775,8 @@ class OllamaRuntime:
         self.bus.publish("info", f"agent/{persona.key}", f"thinking ({self.model})…")
         started = time.monotonic()
         turn = await asyncio.to_thread(self._consume, persona.key, payload, log_sentences, on_delta)
+        if turn.aborted:
+            return ""
         self.bus.publish("info", f"agent/{persona.key}", f"step complete in {time.monotonic() - started:.1f}s")
         return strip_think(turn.answer)
 
@@ -695,6 +859,11 @@ class OllamaRuntime:
 
         def take(event: StreamEvent) -> None:
             nonlocal sentence_buf, thought_buf, since_spike
+            if event.kind == "done":
+                turn.prompt_tokens = event.prompt_tokens
+                turn.eval_tokens = event.eval_tokens
+                turn.done_reason = event.done_reason
+                return
             if event.kind == "tools":
                 turn.tool_calls.extend(event.tool_calls)
                 return
@@ -726,6 +895,15 @@ class OllamaRuntime:
             # the loop body ran even once, so every token arrived in one burst
             # at the end and nothing actually streamed. Chain it lazily.
             for event in (() if first is None else itertools.chain((first,), stream)):
+                if self._abort.is_set():
+                    turn.aborted = True
+                    # Close the generator rather than merely dropping it: that
+                    # is what unwinds `_stream_chat`'s `with` block and hangs
+                    # up on Ollama, instead of leaving the model generating
+                    # into a socket nobody reads until it finishes.
+                    with contextlib.suppress(Exception):
+                        stream.close()
+                    break
                 take(event)
             tail_answer, tail_thought = filt.flush()
             if tail_thought:
@@ -748,7 +926,34 @@ class OllamaRuntime:
             self.bus.publish("error", f"agent/{key}", f"model call failed: {type(exc).__name__}: {exc}")
             raise
         turn.answer = "".join(answer_parts)
+        self._warn_if_squeezed(key, turn)
+        if self.on_usage is not None and turn.prompt_tokens:
+            with contextlib.suppress(Exception):
+                self.on_usage(turn.prompt_tokens, turn.eval_tokens)
         return turn
+
+    def _warn_if_squeezed(self, key: str, turn: Turn) -> None:
+        """Say so when the answer was cut, or the prompt nearly filled the window.
+
+        Both failures are otherwise invisible: a truncated answer simply reads
+        as a short one, and an over-long prompt is silently trimmed by Ollama
+        from the oldest end - so the model loses the conversation rather than
+        reporting that it did. Tool schemas are the usual cause; 33 of them
+        cost roughly 3,200 tokens before anything is said.
+        """
+        if turn.done_reason == "length":
+            self.bus.publish(
+                "warn", f"agent/{key}",
+                f"answer cut off at the {settings.num_predict}-token ceiling - "
+                "raise JARVIS_NUM_PREDICT if this recurs",
+            )
+        window = settings.num_ctx
+        if window and turn.prompt_tokens >= window * 0.8:
+            self.bus.publish(
+                "warn", f"agent/{key}",
+                f"prompt used {turn.prompt_tokens} of {window} context tokens - "
+                "older turns are being dropped; raise JARVIS_NUM_CTX or disable tools",
+            )
 
     # -- real CrewAI path ---------------------------------------------------------------
 

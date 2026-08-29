@@ -65,6 +65,17 @@ class Settings:
     # assistant. Users opt in per-session from the panel or by voice.
     think: bool = field(default_factory=lambda: _env_bool("THINK", False))
     memory_turns: int = field(default_factory=lambda: _env_int("MEMORY_TURNS", 8))
+    #: Start a fresh working context when nothing has been said for this long.
+    #: A conversation left open overnight otherwise arrives tomorrow still
+    #: carrying yesterday, and every turn pays to re-read it. 0 disables.
+    context_idle_reset_s: float = field(
+        default_factory=lambda: _env_float("CONTEXT_IDLE_RESET_S", 900.0)
+    )
+    #: Headroom kept free for the answer and the per-turn grounding (persona,
+    #: reflexes, recall) when deciding how much conversation still fits.
+    context_reserve_tokens: int = field(
+        default_factory=lambda: _env_int("CONTEXT_RESERVE_TOKENS", 900)
+    )
     #: personality preset key - see personas.py
     persona: str = field(default_factory=lambda: _env("PERSONA", "jarvis"))
     #: let the cortex call skills natively when the model supports it
@@ -78,8 +89,16 @@ class Settings:
     #: preload the model into VRAM at boot / on model switch, so the first
     #: directive never pays the load cost
     preload: bool = field(default_factory=lambda: _env_bool("PRELOAD", True))
-    #: context window handed to Ollama; 0 leaves the server default alone
-    num_ctx: int = field(default_factory=lambda: _env_int("NUM_CTX", 4096))
+    #: Context window handed to Ollama; 0 leaves the server default alone.
+    #:
+    #: 8192 rather than 4096 because tool schemas are not free: the 33 skills
+    #: this assistant registers cost ~3,200 prompt tokens on their own, before
+    #: the persona, the reflex grounding, the recalled fragments or the
+    #: conversation. At 4096 that left too little room, and the failure is
+    #: silent - Ollama drops the oldest messages to make the prompt fit, so
+    #: the assistant forgets the conversation rather than saying it cannot
+    #: hold it. `_warn_if_squeezed` now reports when this is close.
+    num_ctx: int = field(default_factory=lambda: _env_int("NUM_CTX", 8192))
     #: hard ceiling on generated tokens - a runaway answer is a hung assistant
     num_predict: int = field(default_factory=lambda: _env_int("NUM_PREDICT", 512))
     #: retries for a transient Ollama transport failure
@@ -109,7 +128,10 @@ class Settings:
     tts_quality: str = field(default_factory=lambda: _env("TTS_QUALITY", "fp32"))
     tts_warmup: bool = field(default_factory=lambda: _env_bool("TTS_WARMUP", True))
     sample_rate: int = 24000  # Kokoro native output rate; fallback matches it.
-    tts_frame_samples: int = field(default_factory=lambda: _env_int("TTS_FRAME_SAMPLES", 4800))  # ~200ms @ 24kHz
+    #: PCM transport frame size. 100ms rather than 200ms: the first packet of
+    #: an utterance leaves the moment it exists instead of waiting to fill a
+    #: bigger buffer, and the browser gets finer scheduling granularity.
+    tts_frame_samples: int = field(default_factory=lambda: _env_int("TTS_FRAME_SAMPLES", 2400))  # ~100ms @ 24kHz
     tts_max_chars: int = field(default_factory=lambda: _env_int("TTS_MAX_CHARS", 1800))
     #: default interface playback gain, 0..1
     volume: float = field(default_factory=lambda: _env_float("VOLUME", 0.9))
@@ -127,8 +149,37 @@ class Settings:
     #: fragment alone can cost several seconds of silence. Breaking it early
     #: gets the assistant talking; by the time that clause has been spoken the
     #: rest of the answer is long since synthesised.
-    speech_first_min_chars: int = field(default_factory=lambda: _env_int("SPEECH_FIRST_MIN_CHARS", 40))
-    speech_first_max_chars: int = field(default_factory=lambda: _env_int("SPEECH_FIRST_MAX_CHARS", 150))
+    #: Both are measured, not guessed, and the floor is not there for prosody.
+    #: Kokoro's time to its first sample against fragment length has a cliff
+    #: just under ~32 characters (median over six sentences, this machine):
+    #:
+    #:     26ch -> 1.15s for 1.5s of speech      38ch -> 0.67s for 3.3s
+    #:     30ch -> 1.21s for 1.9s of speech      46ch -> 0.76s for 3.8s
+    #:     34ch -> 0.67s for 3.0s of speech      56ch -> 0.91s for 4.5s
+    #:
+    #: A shorter opening fragment is therefore *slower to speak and shorter
+    #: when spoken* - the worst of both - so asking for less than ~34
+    #: characters costs half a second and buys nothing. Above the cliff the
+    #: cost is roughly linear, and 34-46 is where latency is lowest while
+    #: still returning several seconds of audio to synthesise the rest behind.
+    speech_first_min_chars: int = field(default_factory=lambda: _env_int("SPEECH_FIRST_MIN_CHARS", 34))
+    #: ...and must break by here even if no clause boundary ever turns up. Kept
+    #: tight on purpose: an answer with no comma in it at all is entirely
+    #: ordinary, and a generous ceiling means those answers are never streamed.
+    speech_first_max_chars: int = field(default_factory=lambda: _env_int("SPEECH_FIRST_MAX_CHARS", 46))
+
+    # --- Full-duplex conversation ------------------------------------------
+    #: A spoken directive that arrives while J.A.R.V.I.S. is still talking
+    #: cuts the utterance off instead of queueing behind it. Without this the
+    #: operator waits out the whole answer before the next one even starts.
+    barge_in: bool = field(default_factory=lambda: _env_bool("BARGE_IN", True))
+    #: How far back a spoken directive is compared against what was just
+    #: said aloud. Covers the recogniser's own finalisation lag, which is why
+    #: it is seconds rather than milliseconds.
+    echo_guard_ms: int = field(default_factory=lambda: _env_int("ECHO_GUARD_MS", 4000))
+    #: Fraction of a transcript's content words that must have just been
+    #: spoken before it is dismissed as the microphone hearing the speakers.
+    echo_similarity: float = field(default_factory=lambda: _env_float("ECHO_SIMILARITY", 0.6))
 
     # --- Server ------------------------------------------------------------
     cors_origins: str = field(default_factory=lambda: _env("CORS_ORIGINS", "*"))

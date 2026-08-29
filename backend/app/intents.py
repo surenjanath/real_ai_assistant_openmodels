@@ -56,6 +56,11 @@ _PERSONA_WORDS = {
     "jarvis", "concise", "brief", "short", "terse", "engineer", "engineering",
     "technical", "socratic", "curious", "friday", "warm", "casual", "formal",
     "butler",
+    # "be angry" / "rage mode" / "trini mode" reach the disposition switch the
+    # same way "be more concise" does. Only words that *name* a personality
+    # belong here - "be more careful" must still go to the model.
+    "rage", "angry", "furious", "aggressive", "sweary", "trini", "trinidad",
+    "trinidadian", "caribbean",
 }
 
 _MODELS = r"(?:models?|llms?|brains?)"

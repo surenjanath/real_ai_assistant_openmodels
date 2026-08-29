@@ -58,6 +58,15 @@ class Runtime(Protocol):
         """Execute the command; publish reasoning logs; return the answer."""
         ...  # pragma: no cover
 
+    def abort(self) -> None:
+        """Cut the current run short - the operator has moved on.
+
+        Cooperative and best-effort: `run` returns an empty string once it
+        notices, which the orchestrator reads as "say nothing". Implementations
+        that cannot be interrupted may leave this a no-op.
+        """
+        ...  # pragma: no cover
+
 
 def persona_for(bus: LogBus) -> str:
     """Stable short prefix used in log lines, e.g. 'agent/engineer'."""

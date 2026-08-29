@@ -16,6 +16,10 @@ from ..logbus import LogBus
 from .base import Runtime
 
 
+class _Interrupted(Exception):
+    """Raised out of a pause when the operator cuts the trace short."""
+
+
 def _short(text: str, limit: int = 42) -> str:
     text = " ".join(text.split())
     return (text[: limit - 1] + "…") if len(text) > limit else text
@@ -27,8 +31,20 @@ class SimulatedRuntime:
     def __init__(self, bus: LogBus, model_hint: str = "") -> None:
         self.bus = bus
         self.model_hint = model_hint
+        self._aborted = False
+
+    def abort(self) -> None:
+        """Cut the trace short - see `Runtime.abort`."""
+        self._aborted = True
 
     async def run(self, text: str) -> str:
+        self._aborted = False
+        try:
+            return await self._trace(text)
+        except _Interrupted:
+            return ""
+
+    async def _trace(self, text: str) -> str:
         bus = self.bus
         model_note = f" [model {self.model_hint} unverified - ollama offline]" if self.model_hint else ""
         seed = int(hashlib.blake2b(text.encode(), digest_size=3).hexdigest(), 16)
@@ -59,7 +75,10 @@ class SimulatedRuntime:
         return self._answer(text, rng)
 
     async def _step(self, delay: float) -> None:
+        """A pause in the trace, and the only place an interrupt can land."""
         await asyncio.sleep(delay)
+        if self._aborted:
+            raise _Interrupted
 
     @staticmethod
     def _plan(text: str, rng: random.Random) -> list[str]:

@@ -56,8 +56,36 @@ def main() -> int:
                 f"got {joined!r}",
             )
 
-    frags = stream("A flywheel stores energy. It smooths an engine's output. That is all.")
+    frags = stream(
+        "A flywheel stores kinetic energy in a spinning mass. "
+        "It smooths the uneven output of an engine. That is the whole idea."
+    )
     check("splits on full stops", len(frags) == 3, f"got {frags}")
+
+    # An answer that opens "Certainly, sir." must not ship those fifteen
+    # characters as a fragment of their own: below ~32 characters Kokoro takes
+    # as long as it would for ninety and hands back barely a second of audio,
+    # so there is no time to synthesise what comes next and the answer stalls
+    # audibly right after the greeting.
+    frags = stream("Certainly, sir. The processor is holding at eleven percent for now.")
+    check(
+        "a short opening sentence is not spoken on its own",
+        frags[0] != "Certainly, sir.",
+        f"opened with {frags[0]!r}",
+    )
+    check(
+        "the opening fragment clears the synthesis floor",
+        len(frags[0]) >= 30,
+        f"opening was {len(frags[0])} chars: {frags[0]!r}",
+    )
+    # ...but a short sentence *after* the opening is fine: by then there is
+    # already audio playing to cover the next synthesis pass.
+    frags = stream("The diagnostics are complete and every subsystem is nominal. Yes, all of it. Standing by.")
+    check(
+        "a short later sentence still gets its own fragment",
+        any(f.strip() == "Yes, all of it." for f in frags),
+        f"got {frags}",
+    )
 
     frags = stream("Dr. Stark is in the lab. All good here.")
     check("does not split on an abbreviation", frags[0].startswith("Dr. Stark"), f"got {frags}")
@@ -82,6 +110,45 @@ def main() -> int:
         f"{len(frags[0])} chars",
     )
     check("later fragments are whole sentences", frags[-1].endswith("."), f"got {frags[-1]!r}")
+
+    # A regression pin, and the reason streamed speech was doing nothing at
+    # all for a whole class of answers. Plenty of perfectly ordinary replies
+    # contain no comma anywhere - and if the opening fragment can only break
+    # at a clause boundary, those answers are never released until the model
+    # has finished writing. Streaming is then pure overhead: the operator
+    # waits out the entire generation before hearing a single word.
+    no_comma = (
+        "A marathon is a long-distance running event covering a standard "
+        "distance of twenty-six miles and 385 yards."
+    )
+    segmenter = SentenceSegmenter()
+    released: list[str] = []
+    for i in range(0, len(no_comma), 4):
+        released += segmenter.push(no_comma[i : i + 4])
+    check(
+        "an answer with no commas still starts speaking early",
+        bool(released),
+        "nothing was released until the answer was complete",
+    )
+    if released:
+        opening = released[0]
+        check(
+            "it starts speaking well before the answer ends",
+            len(opening) < len(no_comma) * 0.75,
+            f"opening was {len(opening)}/{len(no_comma)} chars",
+        )
+        # The break is heard, so where it lands matters: a fragment ending on
+        # "covering a" makes the assistant sound like it lost its place.
+        check(
+            "the break does not land on a dangling word",
+            opening.split()[-1].lower() not in {"a", "an", "the", "of", "and", "to", "in", "is"},
+            f"opening ended on {opening.split()[-1]!r}",
+        )
+    check(
+        "nothing is lost or duplicated by an early break",
+        " ".join(" ".join(released + segmenter.drain()).split()) == " ".join(no_comma.split()),
+        f"got {released + segmenter.drain()}",
+    )
 
     # A wall of text with no punctuation must still be broken up, or the
     # assistant stays silent until the very end of it.

@@ -17,6 +17,8 @@ GET  /api/models        the Ollama catalogue + any download in flight
 POST /api/models/pull   install a model without leaving the interface
 DELETE /api/models/pull cancel the download in flight
 GET  /api/personas      selectable dispositions
+POST /api/personas      create or edit one (persisted to ~/.jarvis/personas.json)
+DELETE /api/personas/{key}  delete a custom one, or reset an edited built-in
 GET  /api/sessions      past conversations, newest first
 GET  /api/sessions/{id} one conversation in full
 DELETE /api/sessions/{id}  erase one conversation
@@ -59,6 +61,7 @@ from .memory import Memory
 from .metrics import Metrics
 from .neural import NeuralBus
 from .orchestrator import Orchestrator
+from . import personas as personas_mod
 from .personas import catalogue as persona_catalogue
 from .puller import ModelPuller
 from .registry import Registry
@@ -72,6 +75,11 @@ _started = time.monotonic()
 _bus = LogBus(backlog_size=settings.log_backlog)
 _engine, _engine_mode = build_engine(_bus)
 _tts = TTSManager(_bus, _engine)
+# The operator's own dispositions are layered over the built-ins before the
+# registry is constructed, so a saved `persona` preference naming a custom one
+# resolves on the very first boot rather than falling back to the default.
+_persona_error = personas_mod.reload()
+
 _registry = Registry(bus=_bus)
 _registry.attach_engine(_engine)
 _neural = NeuralBus(_bus)
@@ -141,6 +149,13 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
             f"hippocampus online - {stats['turns']} exchanges, {stats['facts']} facts "
             f"({'fts5' if stats['fts'] else 'scan'} recall)",
         )
+    if _persona_error:
+        _bus.publish("warn", "settings",
+                     f"personas.json could not be read ({_persona_error}) - built-ins only")
+    elif personas_mod.CUSTOM:
+        own = ", ".join(sorted(personas_mod.CUSTOM))
+        _bus.publish("info", "settings",
+                     f"{len(personas_mod.CUSTOM)} operator disposition(s) loaded: {own}")
     if _kit is not None:
         gated = [s.name for s in _kit.skills.values() if s.danger != "safe"]
         _bus.publish(
@@ -342,7 +357,62 @@ async def cancel_pull() -> dict[str, Any]:
 
 @app.get("/api/personas")
 async def personas() -> dict[str, Any]:
-    return {"ok": True, "current": _registry.persona, "personas": persona_catalogue()}
+    return {"ok": True, "current": _registry.persona, "personas": persona_catalogue(),
+            "path": str(personas_mod.personas_path())}
+
+
+def _persona_changed() -> None:
+    """Push the new catalogue to every client and re-sync the voice engine.
+
+    Editing the disposition that is *currently selected* has to take effect
+    now - including its voice - or the operator changes the manner, hears the
+    old one, and reasonably concludes the edit did not save.
+    """
+    _registry.reconcile_persona()
+    _registry.broadcast()
+
+
+@app.post("/api/personas")
+async def upsert_persona(payload: dict) -> dict[str, Any]:
+    """Create or edit a disposition."""
+    key = payload.get("key")
+    body = dict(payload)
+    # A voice that does not exist would leave the disposition silently speaking
+    # in whatever was selected before, which reads as the edit not working.
+    if body.get("voice"):
+        resolved = _registry.resolve_voice(str(body["voice"]))
+        if resolved is None:
+            return {"ok": False, "error": f"unknown voice '{body['voice']}'"}
+        body["voice"] = resolved
+    try:
+        persona = await asyncio.to_thread(
+            personas_mod.upsert, body, key=str(key) if key else None
+        )
+    except personas_mod.PersonaError as exc:
+        return {"ok": False, "error": str(exc)}
+    except OSError as exc:
+        return {"ok": False, "error": f"could not save: {exc}"}
+    _bus.publish("success", "settings", f"disposition '{persona.label}' saved")
+    _persona_changed()
+    return {"ok": True, "persona": persona.key, "personas": persona_catalogue()}
+
+
+@app.delete("/api/personas/{key}")
+async def delete_persona(key: str) -> dict[str, Any]:
+    """Delete a custom disposition, or reset a built-in to how it shipped."""
+    try:
+        what = await asyncio.to_thread(personas_mod.remove, key)
+    except personas_mod.PersonaError as exc:
+        return {"ok": False, "error": str(exc)}
+    except OSError as exc:
+        return {"ok": False, "error": f"could not save: {exc}"}
+    # Selecting a disposition that has just been deleted would leave the
+    # registry pointing at nothing; fall back to the default.
+    if _registry.persona not in personas_mod.PERSONALITIES:
+        _registry.apply(persona=personas_mod.DEFAULT_PERSONA, announce=False)
+    _bus.publish("info", "settings", f"disposition '{key}' {what}")
+    _persona_changed()
+    return {"ok": True, "result": what, "personas": persona_catalogue()}
 
 
 @app.get("/api/skills")
@@ -627,7 +697,9 @@ async def _logs_receiver(ws: WebSocket) -> None:
                 # nowait: a full queue must drop the directive with a warning
                 # rather than block this socket's receive loop, which would
                 # also stall barge-in and settings frames from the same client.
-                await _orchestrator.enqueue_nowait(text, origin)
+                await _orchestrator.enqueue_nowait(
+                    text, origin, verified=bool(message.get("verified")),
+                )
         elif mtype == "ping":
             await ws.send_json({"type": "pong", "ts": message.get("ts", time.time())})
         elif mtype == "stop":

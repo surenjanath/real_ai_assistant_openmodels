@@ -198,7 +198,174 @@ with tempfile.TemporaryDirectory() as tmp:
     check("a fact recalls fuzzily", view.recall_fact("sister") == "Ada")
     hits = next(f["hits"] for f in view.all_facts() if f["key"] == "sister's name")
     check("a fuzzy recall counts as a hit", hits == 2, f"got {hits}")
+
+    # -- recall must not feed the assistant its own answers ----------------
+    #
+    # A regression pin for the nastiest failure this store can produce. Asked
+    # for a value it could not compute, the model invents one; the invention
+    # is persisted like any other turn; recall then serves it back on every
+    # later asking as established context, and the model stops calling the
+    # tool that would have got it right. One hallucination becomes permanent.
+    #
+    # The fix is structural, not a prose caveat: automatic recall reads
+    # operator turns only. The `recall` *skill* still searches everything, so
+    # "what did you tell me earlier" keeps working - the difference is that it
+    # is asked for rather than fed in.
+    view.add_turn("user", "what is the sha256 of the word jarvis")
+    view.add_turn("assistant", "The sha256 of the word jarvis is 8c0e9a0dfabricated.")
+
+    grounding = view.search("sha256 jarvis", limit=6, roles=("user",))
+    check("auto-recall returns operator turns", bool(grounding))
+    check("auto-recall never returns the assistant's own answers",
+          all(h.role == "user" for h in grounding),
+          f"got roles {[h.role for h in grounding]}")
+    check("...so a fabricated value cannot come back as context",
+          not any("fabricated" in h.text for h in grounding))
+
+    everything = view.search("sha256 jarvis", limit=6)
+    check("an explicit recall can still see both sides",
+          {h.role for h in everything} == {"user", "assistant"},
+          f"got roles {[h.role for h in everything]}")
     view.close()
+
+# ------------------------------------------------------- dispositions
+
+print("\n-- a disposition carries its own voice --")
+
+from app.intents import parse_intent  # noqa: E402
+from app.personas import PERSONALITIES, find as find_persona  # noqa: E402
+from app.registry import KOKORO_VOICES, Registry  # noqa: E402
+from app.logbus import LogBus  # noqa: E402
+
+
+class _NoPrefs(Prefs):
+    def __init__(self) -> None:
+        super().__init__(path=Path("/nonexistent/jarvis-persona-test.json"))
+
+    def save(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        return None
+
+
+_quiet = LogBus()
+_quiet.publish = lambda *a, **k: None  # type: ignore[method-assign]
+
+# A voice that does not exist would leave the disposition silently on whatever
+# was selected before, which reads as the setting not working at all.
+for _p in PERSONALITIES.values():
+    check(f"{_p.label} names a real voice", _p.voice in KOKORO_VOICES, f"got {_p.voice}")
+    check(f"{_p.label} speaks at a sane rate", 0.5 <= _p.speed <= 2.0, f"got {_p.speed}")
+
+_reg = Registry(bus=_quiet, prefs=_NoPrefs())
+_reg.apply(persona="rage", announce=False)
+check("choosing a disposition adopts its voice",
+      _reg.voice == PERSONALITIES["rage"].voice, f"got {_reg.voice}")
+check("...and its speech rate", abs(_reg.speed - PERSONALITIES["rage"].speed) < 1e-6)
+
+# An explicit voice in the same breath has to win, or the settings panel could
+# never override the pairing and "switch to Friday in George's voice" would lie.
+_reg.apply(persona="jarvis", voice="af_nova", announce=False)
+check("an explicit voice outranks the disposition's", _reg.voice == "af_nova",
+      f"got {_reg.voice}")
+# ...and a voice change on its own must not drag the disposition with it.
+_before = _reg.persona
+_reg.apply(voice="bf_emma", announce=False)
+check("changing voice alone leaves the disposition", _reg.persona == _before)
+
+print("\n-- the new dispositions are reachable by voice --")
+
+for phrase, expected in [
+    ("be angry", "rage"),
+    ("rage mode", "rage"),
+    ("trini mode", "trini"),
+    ("switch persona to trinidadian", "trini"),
+    ("switch persona to caribbean", "trini"),
+]:
+    intent = parse_intent(phrase)
+    got = find_persona(intent.value) if intent and intent.value else None
+    check(f"{phrase!r} -> {expected}", got is not None and got.key == expected,
+          f"got {intent.kind if intent else None}/{got.key if got else None}")
+
+# "be more careful" is an instruction to the model, not a disposition switch;
+# widening the persona word list must not have swallowed it.
+check("'be more careful' still reaches the model",
+      parse_intent("be more careful") is None,
+      f"got {parse_intent('be more careful')}")
+
+print("\n-- operator dispositions --")
+
+from app import personas as _P  # noqa: E402
+
+_pfile = Path(tempfile.mkdtemp()) / "personas.json"
+_P.CUSTOM.clear()
+_P.rebuild()
+_builtins = len(_P.BUILTIN)
+
+_new = _P.upsert(
+    {"label": "Pirate", "blurb": "Yarr.",
+     "style": "Talk like a pirate at all times, with plenty of yarr and matey.",
+     "voice": "am_puck", "speed": 1.05},
+    path=_pfile,
+)
+check("a disposition can be added", _new.key == "pirate", f"got {_new.key}")
+check("...and joins the catalogue", len(_P.PERSONALITIES) == _builtins + 1)
+check("...and is findable by name", (_P.find("pirate") or _P.find("x")).key == "pirate")
+
+# The file is the whole point: a disposition that vanishes on restart is worse
+# than not being able to make one.
+_P.CUSTOM.clear()
+_P.rebuild()
+check("a fresh process has only the built-ins", len(_P.PERSONALITIES) == _builtins)
+_P.reload(_pfile)
+check("...and reloads the operator's from disk", "pirate" in _P.PERSONALITIES)
+check("...with its voice intact", _P.PERSONALITIES["pirate"].voice == "am_puck")
+
+# Editing a built-in must keep its key, or every saved preference and spoken
+# phrase naming it breaks.
+_P.upsert({"label": "J.A.R.V.I.S.", "blurb": "changed",
+           "style": "Be exceptionally formal and never use a contraction."},
+          key="jarvis", path=_pfile)
+check("a built-in can be edited in place", _P.PERSONALITIES["jarvis"].blurb == "changed")
+check("...and is flagged as edited", _P.is_edited("jarvis"))
+check("...while still being a built-in", _P.is_builtin("jarvis"))
+check("resetting it restores the original", _P.remove("jarvis", path=_pfile) == "reset")
+check("...literally the shipped text",
+      _P.PERSONALITIES["jarvis"].blurb == _P.BUILTIN["jarvis"].blurb)
+
+check("a custom one is deleted outright", _P.remove("pirate", path=_pfile) == "deleted")
+refuses_persona = False
+try:
+    _P.remove("friday", path=_pfile)
+except _P.PersonaError:
+    refuses_persona = True
+check("an untouched built-in cannot be deleted", refuses_persona)
+
+# Rejections have to be specific enough to fix, and must never write.
+for bad, why in [
+    ({"label": "X", "style": "short"}, "a style that says nothing"),
+    ({"label": "", "style": "A perfectly good manner of speaking, at length."}, "no name"),
+    ({"label": "!!", "style": "A perfectly good manner of speaking, at length."}, "an unusable key"),
+]:
+    rejected = False
+    try:
+        _P.normalise(bad)
+    except _P.PersonaError:
+        rejected = True
+    check(f"rejects {why}", rejected)
+
+# A file someone hand-edited into nonsense must cost them that file, not the
+# assistant.
+_pfile.write_text("{ not json at all", encoding="utf-8")
+_customs, _err = _P.load_custom(_pfile)
+check("a corrupt personas.json is reported, not fatal", _customs == {} and _err is not None)
+_pfile.write_text('{"personas": [{"label": "Bad"}, {"label": "Good", '
+                  '"style": "Speak plainly and briefly at all times please."}]}',
+                  encoding="utf-8")
+_customs, _err = _P.load_custom(_pfile)
+check("one broken entry does not cost the others",
+      set(_customs) == {"good"}, f"got {set(_customs)}")
+
+_P.CUSTOM.clear()
+_P.rebuild()
 
 print()
 if _failures:
