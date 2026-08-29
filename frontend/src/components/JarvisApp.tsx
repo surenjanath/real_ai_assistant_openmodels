@@ -13,6 +13,7 @@ import MathAnchor from "./MathAnchor";
 import Overlays from "./Overlays";
 import SettingsPanel from "./SettingsPanel";
 import TelemetryPanel from "./TelemetryPanel";
+import Toasts from "./Toasts";
 import VitalsPanel from "./VitalsPanel";
 import { useJarvisConnection } from "@/hooks/useJarvisConnection";
 import { THEMES, useJarvis, type Theme } from "@/state/jarvis";
@@ -74,6 +75,7 @@ export default function JarvisApp() {
       <Overlays />
       <CommandPalette />
       <MathAnchor />
+      <Toasts />
 
       <div className={`boot-veil ${logsConnected ? "gone" : ""}`}>
         <span className="boot-mark">J.A.R.V.I.S.</span>

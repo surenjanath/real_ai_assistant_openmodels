@@ -99,6 +99,9 @@ export default function CommandPalette() {
       { id: "panel-metrics", label: "Open performance view", hint: "timing history", group: "panels", run: () => setOverlay("metrics") },
       { id: "panel-skills", label: "Open skill catalogue", hint: "what it can actually do", group: "panels", run: () => setOverlay("skills") },
       { id: "panel-neural", label: "Open cognitive map", hint: "every node and synapse", group: "panels", run: () => setOverlay("neural") },
+      { id: "panel-archive", label: "Open the archive", hint: "past conversations & audit trail", group: "panels", run: () => setOverlay("archive") },
+      { id: "panel-audit", label: "Audit trail", hint: "every skill this machine has run", group: "panels", run: () => setOverlay("archive") },
+      { id: "panel-help", label: "Reference card", hint: "shortcuts & phrases · ?", group: "panels", run: () => setOverlay("help") },
       { id: "export", label: "Export transcript", hint: "opens plain text", group: "panels", run: () => window.open("/api/export?fmt=text&limit=500", "_blank") },
     ];
 

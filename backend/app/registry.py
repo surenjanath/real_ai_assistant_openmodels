@@ -9,8 +9,10 @@ Sources of truth:
   * voices    - the Kokoro-82M v1.0 voice set, grouped by accent/gender.
 
 Every change is broadcast to all telemetry clients as a `settings.update`
-frame and mirrored onto the live TTS engine, so voice/speed changes are
-audible on the very next utterance without a restart.
+frame, mirrored onto the live TTS engine (so voice/speed changes are audible
+on the very next utterance without a restart) and written through to
+`~/.jarvis/settings.json`, so the assistant comes back up the way you left it
+rather than reverting to whatever the shell environment happened to say.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from dataclasses import dataclass, field
 from .config import settings
 from .logbus import LogBus
 from .personas import catalogue as persona_catalogue, find as find_persona
+from .prefs import Prefs
 
 # Suggestions only - shown in the picker, never treated as installed.
 DEFAULT_MODELS = [
@@ -98,9 +101,73 @@ class Registry:
     recall: bool = field(default_factory=lambda: settings.recall)
     #: playback gain 0..1, mirrored onto the interface
     volume: float = field(default_factory=lambda: settings.volume)
+    #: speak each sentence as it is written rather than waiting for the answer
+    stream_speech: bool = field(default_factory=lambda: settings.stream_speech)
     #: model tag -> capability list, as reported by Ollama /api/tags
     capabilities: dict[str, list[str]] = field(default_factory=dict)
+    #: notified with the new tag whenever the crew model changes, so the
+    #: runtime can page the new weights in before the next directive lands
+    on_model_change: object | None = None
+    #: durable operator preferences; saved choices outrank env defaults
+    prefs: Prefs = field(default_factory=Prefs)
     _engine: object | None = None
+
+    def __post_init__(self) -> None:
+        """Overlay saved preferences on top of the environment defaults.
+
+        Applied directly rather than through `apply()`: at construction time
+        there is no bus subscriber to broadcast to, no engine to mirror onto,
+        and `tools`/`think` cannot be validated because the Ollama catalogue
+        has not been fetched yet. `reconcile()` re-checks those two once it
+        has.
+        """
+        saved = self.prefs.values
+        if not saved:
+            return
+        restored: list[str] = []
+        if isinstance(saved.get("model"), str) and saved["model"]:
+            self.model = saved["model"]
+            restored.append("model")
+        if isinstance(saved.get("voice"), str) and saved["voice"] in self.voices:
+            self.voice = saved["voice"]
+            restored.append("voice")
+        if isinstance(saved.get("speed"), (int, float)):
+            self.speed = max(0.5, min(2.0, round(float(saved["speed"]), 2)))
+            restored.append("speed")
+        if isinstance(saved.get("volume"), (int, float)):
+            self.volume = max(0.0, min(1.0, round(float(saved["volume"]), 2)))
+            restored.append("volume")
+        if isinstance(saved.get("persona"), str) and find_persona(saved["persona"]):
+            self.persona = find_persona(saved["persona"]).key  # type: ignore[union-attr]
+            restored.append("persona")
+        for flag in ("think", "tools", "recall", "stream_speech"):
+            if isinstance(saved.get(flag), bool):
+                setattr(self, flag, saved[flag])
+                restored.append(flag)
+        if restored:
+            self.bus.publish(
+                "info", "settings",
+                f"restored {len(restored)} saved preference(s) from {self.prefs.path.name}: "
+                + ", ".join(restored),
+            )
+
+    def reconcile(self) -> None:
+        """Re-validate restored flags once the Ollama catalogue is known.
+
+        `think` and `tools` are model capabilities, so a preference saved
+        against one model can be meaningless against the model that is loaded
+        now. Silently standing them down beats advertising a mode the model
+        cannot enter.
+        """
+        if self.think and not self.think_supported:
+            self.think = False
+            self.bus.publish("info", "settings",
+                             f"'{self.model}' has no thinking mode - extended thinking stood down")
+        if self.tools and not self.tools_supported and self.installed:
+            self.bus.publish(
+                "info", "settings",
+                f"'{self.model}' does not advertise tool calling - skills stay disarmed",
+            )
 
     @property
     def model_verified(self) -> bool:
@@ -172,6 +239,7 @@ class Registry:
                         )
                     else:
                         self.bus.publish("success", "settings", f"crew model auto-selected: {tag}")
+                    self._notify_model(tag)
                     self.broadcast()
                     return tag
         return None
@@ -230,6 +298,7 @@ class Registry:
         tools: bool | None = None,
         recall: bool | None = None,
         volume: float | None = None,
+        stream_speech: bool | None = None,
         announce: bool = True,
     ) -> dict:
         """Validate + apply a settings delta; logs and broadcasts every change."""
@@ -242,6 +311,7 @@ class Registry:
                 if resolved != self.model:
                     self.model = resolved
                     applied["model"] = resolved
+                    self._notify_model(resolved)
             else:
                 errors.append(f"unknown model '{model.strip()}'")
 
@@ -291,6 +361,10 @@ class Registry:
             self.recall = bool(recall)
             applied["recall"] = self.recall
 
+        if stream_speech is not None and bool(stream_speech) != self.stream_speech:
+            self.stream_speech = bool(stream_speech)
+            applied["stream_speech"] = self.stream_speech
+
         if volume is not None:
             try:
                 volume_f = max(0.0, min(1.0, round(float(volume), 2)))
@@ -302,6 +376,7 @@ class Registry:
 
         if applied:
             self._mirror_engine()
+            self._persist(applied)
             if announce:
                 parts = [f"{k} -> {v}" for k, v in applied.items()]
                 self.bus.publish("success", "settings", "applied " + ", ".join(parts))
@@ -310,6 +385,35 @@ class Registry:
             self.bus.publish("error", "settings", err)
         return {"ok": not errors, "applied": applied, "errors": errors,
                 "settings": self.as_dict()}
+
+    def _persist(self, applied: dict[str, object]) -> None:
+        """Write the change through to disk. Never fatal: a settings file we
+        cannot write costs persistence, not the running assistant."""
+        if not self.prefs.save(applied):
+            self.bus.publish(
+                "warn", "settings",
+                f"could not save preferences ({self.prefs.error}) - this session only",
+            )
+
+    def forget_prefs(self) -> bool:
+        """Drop the saved preference file; the next boot uses env defaults."""
+        ok = self.prefs.clear()
+        self.bus.publish(
+            "warn" if ok else "error", "settings",
+            "saved preferences erased - environment defaults apply on next boot"
+            if ok else f"could not erase preferences: {self.prefs.error}",
+        )
+        return ok
+
+    def _notify_model(self, tag: str) -> None:
+        """Fire the model-change hook without ever letting it break `apply`."""
+        hook = self.on_model_change
+        if hook is None:
+            return
+        try:
+            hook(tag)  # type: ignore[operator]
+        except Exception as exc:  # noqa: BLE001
+            self.bus.publish("warn", "settings", f"model hook failed: {type(exc).__name__}")
 
     def broadcast(self) -> None:
         """Push the current settings to every telemetry client."""
@@ -335,4 +439,7 @@ class Registry:
             "tools_active": self.tools_active,
             "recall": self.recall,
             "volume": self.volume,
+            "stream_speech": self.stream_speech,
+            "persisted": sorted(self.prefs.values),
+            "prefs_path": str(self.prefs.path),
         }

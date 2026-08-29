@@ -587,13 +587,30 @@ button {
   opacity: 0;
   transform: translateY(6px);
   transition: opacity 320ms ease, transform 320ms ease;
-  max-height: 6.6em;
+  /* Four lines of prose plus the plate's own padding. `box-sizing: border-box`
+     is global, so the padding has to be added explicitly here or the fourth
+     line is sliced through the middle of its glyphs. */
+  max-height: calc(1.6em * 4 + 24px);
   overflow: hidden;
   pointer-events: none;
+  /* Anchor to the bottom: a caption is a running transcript of what is being
+     said *now*, so when an answer outgrows the plate the operator needs to see
+     its tail, not its opening. */
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+}
+.caption-text {
+  display: block;
+  width: 100%;
 }
 .caption.on {
   opacity: 1;
   transform: none;
+  /* Soften the top edge so an overflowing caption reads as "there is more
+     above" rather than as a rendering fault. */
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 1.4em);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 1.4em);
 }
 .caret {
   display: inline-block;
@@ -1108,6 +1125,30 @@ html[data-theme="amber"] {
   --blue: #ffca7a;
   --cyan: #ffe3b8;
   --glass-line: rgba(240, 190, 120, 0.16);
+}
+
+html[data-theme="violet"] {
+  --accent: #a78bfa;
+  --accent-soft: #d3c4ff;
+  --accent-deep: #6d4bd8;
+  --accent-glow: rgba(167, 139, 250, 0.5);
+  --wash: rgba(74, 46, 130, 0.24);
+  --blue: #bda5ff;
+  --cyan: #e0d5ff;
+  --glass-line: rgba(180, 150, 250, 0.16);
+}
+
+/* Monochrome: no hue at all. The hologram is the only thing on screen with
+   colour left in it, which is the point — everything chrome recedes. */
+html[data-theme="mono"] {
+  --accent: #c9d1dc;
+  --accent-soft: #eef2f7;
+  --accent-deep: #6d7683;
+  --accent-glow: rgba(201, 209, 220, 0.42);
+  --wash: rgba(70, 78, 90, 0.2);
+  --blue: #c9d1dc;
+  --cyan: #eef2f7;
+  --glass-line: rgba(210, 220, 235, 0.15);
 }
 
 /* ---------- instrument bar (top centre) ---------- */
@@ -1840,6 +1881,8 @@ html[data-theme="amber"] {
 .theme-chip[data-theme-swatch="crimson"]::before { background: #ff6b81; }
 .theme-chip[data-theme-swatch="emerald"]::before { background: #3ddc97; }
 .theme-chip[data-theme-swatch="amber"]::before { background: #ffb545; }
+.theme-chip[data-theme-swatch="violet"]::before { background: #a78bfa; }
+.theme-chip[data-theme-swatch="mono"]::before { background: #c9d1dc; }
 
 .theme-chip.on { border-color: var(--accent); color: var(--accent-soft); }
 
@@ -1930,4 +1973,493 @@ html[data-theme="amber"] {
   transform: scaleX(0.015);
   border-radius: 2px;
   will-change: transform;
+}
+
+/* ============================================================
+   transient notices (Toasts.tsx)
+   ============================================================ */
+
+.toasts {
+  position: fixed;
+  right: 18px;
+  bottom: 132px;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(340px, calc(100vw - 36px));
+  pointer-events: none;
+}
+
+.toast {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  overflow: hidden;
+  border: 1px solid var(--glass-line);
+  border-left: 2px solid var(--muted);
+  border-radius: 7px;
+  background: var(--glass);
+  backdrop-filter: blur(14px);
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.5);
+  pointer-events: auto;
+  animation: toast-in 240ms cubic-bezier(0.2, 0.9, 0.3, 1) both;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(18px) scale(0.98); }
+  to   { opacity: 1; transform: none; }
+}
+
+.toast-glyph {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  margin-top: 1px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  border: 1px solid currentColor;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  line-height: 1;
+}
+
+.toast-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.toast-title {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink);
+}
+
+.toast-detail {
+  font-size: 11.5px;
+  line-height: 1.42;
+  color: var(--dim);
+  /* A model traceback must not push the whole stack off-screen. */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.toast-close {
+  flex: none;
+  padding: 0 2px;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  transition: color 150ms ease;
+}
+.toast-close:hover { color: var(--ink); }
+
+/* A hairline that drains as the notice ages, so a card vanishing is expected
+   rather than startling. */
+.toast-life {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 1px;
+  width: 100%;
+  background: currentColor;
+  opacity: 0.35;
+  transform-origin: left;
+  animation-name: toast-drain;
+  animation-timing-function: linear;
+  animation-fill-mode: forwards;
+}
+
+@keyframes toast-drain {
+  from { transform: scaleX(1); }
+  to   { transform: scaleX(0); }
+}
+
+.toast-error   { border-left-color: var(--red); color: var(--red); }
+.toast-warn    { border-left-color: var(--amber); color: var(--amber); }
+.toast-success { border-left-color: var(--green); color: var(--green); }
+.toast-info    { border-left-color: var(--cyan); color: var(--cyan); }
+.toast-error .toast-glyph,
+.toast-warn .toast-glyph,
+.toast-success .toast-glyph,
+.toast-info .toast-glyph { color: inherit; }
+
+/* a pinned download, which has no lifetime of its own */
+.toast-progress {
+  border-left-color: var(--accent, var(--blue));
+  color: var(--accent, var(--blue));
+}
+.toast-bar {
+  margin-top: 5px;
+  height: 2px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+.toast-bar i {
+  display: block;
+  height: 100%;
+  background: currentColor;
+  box-shadow: 0 0 8px currentColor;
+  transition: width 300ms ease;
+}
+
+/* one-shot action inside a settings field (install this model, …) */
+.settings-action {
+  margin-top: 7px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid rgba(143, 214, 255, 0.32);
+  border-radius: 6px;
+  background: rgba(94, 176, 255, 0.08);
+  color: var(--cyan);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.1em;
+  transition: all 160ms ease;
+}
+.settings-action:hover:not(:disabled) {
+  background: rgba(94, 176, 255, 0.16);
+  border-color: rgba(143, 214, 255, 0.55);
+}
+.settings-action:disabled { opacity: 0.55; cursor: progress; }
+
+/* The quality picker carries four options, so it needs to wrap where the
+   two-state toggles above it do not. */
+.settings-field .toggle-row { flex-wrap: wrap; }
+.settings-field .toggle-row .toggle { min-width: 74px; }
+
+@media (max-width: 900px) {
+  .toasts { bottom: 160px; right: 12px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toast { animation: none; }
+  .toast-life { animation: none; opacity: 0; }
+}
+
+/* ============================================================
+   Archive — past conversations and the audit trail
+   ============================================================ */
+
+/* The archive and the reference card carry more text than the instrument
+   views they share a shell with, so they are given a wider frame. */
+.overlay-panel[data-overlay="archive"],
+.overlay-panel[data-overlay="help"] {
+  width: min(820px, 94vw);
+}
+
+.archive-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.archive-tabs .tab {
+  padding: 6px 12px 9px;
+}
+
+.archive-filter {
+  width: 100%;
+  margin-bottom: 12px;
+  padding: 8px 11px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 11px;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.archive-filter::placeholder { color: var(--muted); }
+.archive-filter:focus { border-color: var(--glass-line); }
+
+.archive-controls {
+  display: flex;
+  gap: 6px;
+  margin: 10px 0 12px;
+}
+
+.archive-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.archive-day {
+  margin: 16px 0 6px;
+  font-size: 8.5px;
+  letter-spacing: 0.24em;
+  color: var(--muted);
+}
+
+.archive-day:first-child { margin-top: 0; }
+
+.archive-row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+
+.archive-row:hover {
+  background: rgba(255, 255, 255, 0.025);
+  border-color: var(--line);
+}
+
+.archive-row.on {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: var(--glass-line);
+}
+
+.archive-open {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 11px;
+  border: 0;
+  background: none;
+  text-align: left;
+  color: inherit;
+  min-width: 0;
+}
+
+.archive-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink);
+  /* Long opening directives must not push the row wider than the panel. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.archive-title em {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.archive-live {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid rgba(74, 222, 128, 0.35);
+  border-radius: 20px;
+  font-size: 8px;
+  font-weight: 400;
+  letter-spacing: 0.16em;
+  color: var(--green);
+  text-transform: uppercase;
+}
+
+.archive-meta {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--muted);
+}
+
+.archive-del {
+  flex: none;
+  padding: 0 11px;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10px;
+  border-radius: 8px;
+  transition: color 0.14s ease, background 0.14s ease;
+}
+
+.archive-del:hover { color: var(--red); }
+
+.archive-del.armed {
+  color: var(--red);
+  background: rgba(255, 107, 107, 0.1);
+}
+
+.archive-transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 4px 0 10px;
+  padding: 12px 14px;
+  border-left: 1px solid var(--glass-line);
+  margin-left: 12px;
+  max-height: 42vh;
+  overflow-y: auto;
+}
+
+.archive-transcript::-webkit-scrollbar { width: 5px; }
+.archive-transcript::-webkit-scrollbar-thumb {
+  background: rgba(120, 170, 240, 0.16);
+  border-radius: 3px;
+}
+
+.turn-stamp {
+  margin-left: 8px;
+  color: rgba(255, 255, 255, 0.2);
+  font-style: normal;
+}
+
+/* ---------- audit trail ---------- */
+
+.audit-tally {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 4px;
+}
+
+.audit-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--dim);
+}
+
+.audit-chip b {
+  color: var(--accent-soft);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+.audit-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.audit-row {
+  display: grid;
+  grid-template-columns: 54px 130px 1fr 58px;
+  gap: 10px;
+  align-items: baseline;
+  padding: 7px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.035);
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+
+.audit-row:hover { background: rgba(255, 255, 255, 0.02); }
+
+.audit-when { color: rgba(255, 255, 255, 0.24); }
+.audit-name { color: var(--accent-soft); }
+
+.audit-args {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.audit-ms {
+  color: var(--muted);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.audit-row.bad .audit-name { color: var(--red); }
+
+/* Narrow windows cannot hold four columns; stack the argument line under the
+   name rather than crushing every column into illegibility. */
+@media (max-width: 640px) {
+  .audit-row {
+    grid-template-columns: 54px 1fr 52px;
+  }
+  .audit-args {
+    grid-column: 2 / -1;
+    white-space: normal;
+  }
+}
+
+/* ============================================================
+   Reference card
+   ============================================================ */
+
+.help-keys {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 6px 18px;
+}
+
+.help-key {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.help-key kbd {
+  flex: none;
+  min-width: 46px;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.03);
+  font-family: var(--mono);
+  font-size: 10px;
+  text-align: center;
+  color: var(--dim);
+}
+
+.help-voice {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 18px 24px;
+}
+
+.help-group-head {
+  margin-bottom: 8px;
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.22em;
+  color: var(--muted);
+}
+
+.help-phrase {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-bottom: 9px;
+}
+
+.help-phrase b {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--accent-soft);
+}
+
+.help-phrase span {
+  font-size: 10px;
+  color: var(--muted);
 }

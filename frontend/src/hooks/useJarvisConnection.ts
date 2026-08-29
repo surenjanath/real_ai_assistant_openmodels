@@ -76,6 +76,31 @@ function wsUrl(path: string): string {
   return `${proto}://${window.location.host}${path}`;
 }
 
+/** Capped exponential backoff with jitter.
+ *
+ * Both sockets drop together whenever the backend restarts, and without the
+ * jitter they retry in lockstep for as long as they are down - two connection
+ * storms arriving at the same instant, every time. */
+function backoff(attempt: number): number {
+  const base = Math.min(8000, 400 * 2 ** attempt);
+  return base * (0.7 + Math.random() * 0.6);
+}
+
+/** Ask the backend to install a model; progress arrives as `model.pull`. */
+export function pullModel(model: string): Promise<boolean> {
+  return fetch("/api/models/pull", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model }),
+  })
+    .then((res) => res.json())
+    .then((data) => {
+      if (!data.ok) useJarvis.getState().pushToast("warn", "Pull refused", String(data.error ?? ""));
+      return Boolean(data.ok);
+    })
+    .catch(() => false);
+}
+
 export function useJarvisConnection(): void {
   /* ---------------- initial settings snapshot ---------------- */
 
@@ -142,6 +167,25 @@ export function useJarvisConnection(): void {
             break;
           case "log":
             s.pushLog(frame.level, frame.source, frame.msg);
+            // An error buried in a scrolling log is an error nobody sees.
+            // `models` is excluded: a failed pull already reports itself
+            // through the `model.pull` frame below, and two cards for one
+            // failure reads as two failures.
+            if (frame.level === "error" && frame.source !== "models") {
+              s.pushToast("error", frame.source, frame.msg);
+            }
+            break;
+          case "model.pull":
+            if (frame.done) {
+              s.setPull(null);
+              s.pushToast(
+                frame.ok ? "success" : "error",
+                frame.ok ? `${frame.model} installed` : `${frame.model} failed`,
+                frame.ok ? "ready to select" : String(frame.detail ?? ""),
+              );
+            } else {
+              s.setPull(frame);
+            }
             break;
           case "status":
             if (["thinking", "speaking", "idle", "listening"].includes(frame.status)) {
@@ -168,6 +212,12 @@ export function useJarvisConnection(): void {
             break;
           case "metrics":
             s.setMetrics(frame);
+            break;
+          case "memory.changed":
+            // Something was erased server-side, possibly by another client.
+            // The archive watches this counter so it never keeps showing a
+            // conversation that no longer exists.
+            s.bumpMemoryVersion();
             break;
           case "tool":
             s.pushTool(frame);
@@ -215,7 +265,7 @@ export function useJarvisConnection(): void {
         st.setConnected("logs", false);
         st.setLatency(null);
         clearInterval(pingTimer);
-        timer = setTimeout(connect, Math.min(8000, 500 * 2 ** retry++));
+        timer = setTimeout(connect, backoff(retry++));
       };
 
       socket.onerror = () => socket?.close();
@@ -285,7 +335,7 @@ export function useJarvisConnection(): void {
       socket.onclose = () => {
         if (stopped) return;
         useJarvis.getState().setConnected("audio", false);
-        timer = setTimeout(connect, Math.min(8000, 500 * 2 ** retry++));
+        timer = setTimeout(connect, backoff(retry++));
       };
       socket.onerror = () => socket?.close();
     };

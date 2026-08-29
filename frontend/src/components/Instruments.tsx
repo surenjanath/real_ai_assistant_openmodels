@@ -65,9 +65,14 @@ export default function Instruments() {
       title="Open the performance view"
       aria-label="Performance instruments"
     >
-      <span className="instr">
+      {/* Time to the first *spoken* word, which is the wait the operator
+          actually experiences. Falls back to the first generated token when
+          the last directive was answered without speech. */}
+      <span className="instr" title="Time from the directive to the first spoken word">
         <span className="instr-label">FIRST WORD</span>
-        <span className="instr-value">{ms(metrics?.ttft_ms.last ?? 0)}</span>
+        <span className="instr-value">
+          {ms(metrics?.ttfa_ms?.last || metrics?.ttft_ms.last || 0)}
+        </span>
       </span>
       <span className="instr-sep" />
       <span className="instr">

@@ -36,6 +36,41 @@ export interface Recollection {
   score: number;
 }
 
+/** One past conversation, as summarised by the backend's session index. */
+export interface SessionSummary {
+  id: number;
+  title: string;
+  turns: number;
+  started_at: number;
+  ended_at: number | null;
+  first_ts: number;
+  last_ts: number;
+  /** the session this process is recording into right now */
+  current: boolean;
+}
+
+export interface SessionTurn {
+  id: number;
+  role: "user" | "assistant";
+  text: string;
+  ts: number;
+  model: string | null;
+  latency_ms: number | null;
+  origin: string | null;
+}
+
+/** One row of the audit trail: a skill that was actually invoked. */
+export interface AuditEvent {
+  ts: number;
+  kind: string;
+  data: {
+    name?: string;
+    args?: Record<string, unknown>;
+    ok?: boolean;
+    ms?: number;
+  };
+}
+
 async function request<T>(path: string, init?: RequestInit, fallback?: T): Promise<T | null> {
   try {
     const res = await fetch(path, {
@@ -71,6 +106,20 @@ export const api = {
     }),
   cancelReminder: (id: number) =>
     request<{ ok: boolean }>(`/api/reminders/${id}`, { method: "DELETE" }),
+
+  sessions: () =>
+    request<{ ok: boolean; current: number; sessions: SessionSummary[] }>("/api/sessions"),
+  session: (id: number) =>
+    request<{ ok: boolean; turns: SessionTurn[] }>(`/api/sessions/${id}`),
+  deleteSession: (id: number) =>
+    request<{ ok: boolean; removed: number }>(`/api/sessions/${id}`, { method: "DELETE" }),
+
+  auditTrail: (limit = 150) =>
+    request<{ ok: boolean; events: AuditEvent[] }>(`/api/events?kind=tool&limit=${limit}`),
+
+  /** Erase the saved preference file — the *next* boot uses env defaults. */
+  forgetPrefs: () =>
+    request<{ ok: boolean }>("/api/settings", { method: "DELETE" }),
 
   searchMemory: (q: string) =>
     request<{ ok: boolean; matches: Recollection[] }>(

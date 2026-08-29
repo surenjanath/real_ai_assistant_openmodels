@@ -69,6 +69,58 @@ When it is on, the reasoning is routed to the telemetry panel as
 it on.
 
 
+### Speed: the assistant speaks before it has finished thinking
+
+The vocal engine is fastest when handed whole sentences — Kokoro synthesises a
+sentence in about a third of the time it takes to say it. So the answer is not
+waited for: `backend/app/tts/segmenter.py` watches the token stream, and the
+moment a sentence closes it goes straight to the vocal engine while the model
+is still writing the next one. The first fragment is even allowed to break at a
+clause, because Kokoro emits no audio until a whole sentence is done and a
+35-word opening sentence is several seconds of silence.
+
+Measured on this project with `qwen3.5:9b`, three-sentence answers, as the gap
+between the answer being composed and the first word being *heard*:
+
+| Speech start | Delay after the answer is composed |
+| --- | --- |
+| **streamed** (default) | **~0.6 s** — and sometimes negative: it is already talking |
+| whole-answer | ~1.9 s |
+
+The gain grows with answer length, since the first sentence closes at the same
+early moment however long the reply turns out to be. Toggle it in the settings
+panel under **SPEECH START**, or set `JARVIS_STREAM_SPEECH=0`.
+
+Two related costs are paid up front rather than on your first directive:
+
+* **Model residency.** Paging an 8B model in costs 2–10 s. The backend preloads
+  it at boot and again the instant you switch model (`JARVIS_PRELOAD`), and
+  sends `keep_alive` so Ollama holds it for the session
+  (`JARVIS_OLLAMA_KEEP_ALIVE`, default `30m`).
+* **Vocal warmup.** The ONNX session is built at boot (`JARVIS_TTS_WARMUP`).
+
+The interface reports both figures: **FIRST WORD** in the instrument bar is the
+time to the first *spoken* word, not the first generated token — open the
+performance view for the p50/p95 of each.
+
+
+### Render quality adapts to the machine
+
+The hologram is 24,000 GPU-displaced particles at full quality, which not every
+machine can sustain — and a scene that drops frames also starves the audio
+callback driving it, so the sphere stops reacting to the voice. The tier is
+picked from what the device reports, then corrected by the frame rate actually
+measured (`frontend/src/state/quality.ts`); it steps down at most once per
+session, never oscillating. Override it under **RENDER QUALITY** in the
+settings panel — the choice is remembered on that device.
+
+| Tier | Particles | Stars | DPR cap | Antialias |
+| --- | --- | --- | --- | --- |
+| high | 24,000 | 520 | 2 | yes |
+| balanced | 12,000 | 340 | 1.5 | yes |
+| low | 5,000 | 160 | 1 | no |
+
+
 ## The neural system
 
 The interface's centrepiece is no longer only audio-reactive — it is
@@ -100,6 +152,38 @@ every node, named and grouped by region, with its live activation. Both are
 painted from their own animation frame straight into the DOM, so twenty
 activation frames a second never pass through React.
 
+## Settings survive the restart
+
+Model, voice, speed, persona, skills, recall, volume and speech streaming are
+written through to `~/.jarvis/settings.json` the moment you change them, and
+restored at boot. Environment variables still win at *first* boot, when there
+is nothing saved yet; after that the saved value is authoritative, because it
+represents a deliberate act rather than a shell default.
+
+Two things are re-validated rather than trusted: `think` and `tools` are model
+*capabilities*, so a preference saved against one model is stood down (with a
+log line) if the model loaded now cannot do it. A corrupt or unwritable
+settings file costs persistence, never the boot — it degrades to session-only
+settings and says so.
+
+`DELETE /api/settings` erases the file; the live session keeps its settings and
+the *next* boot falls back to the environment.
+
+## The archive
+
+Every conversation and every skill invocation has been recorded since the
+hippocampus was added, but neither had a way in. `⌗` in the telemetry header —
+or `⌘P` → *archive* — opens both:
+
+* **Conversations** — each session, newest first, grouped by day and named
+  after its opening directive. Search finds a conversation only when you
+  already remember a word from it; what people actually remember is *when*.
+  Expand one to read it back, or erase it (two clicks, no undo).
+* **Audit trail** — every skill that has actually run, with the arguments it
+  was called with and how long it took. This thing reads files, writes files
+  and, when armed, makes network requests on your machine; a record of that
+  which can only be read with `sqlite3` is not a record anybody checks.
+
 ## Skills — things it can actually do
 
 When the selected model advertises the `tools` capability, the skill schemas
@@ -110,18 +194,41 @@ are attached to every request and the runtime runs the full loop: model →
 | --- | --- |
 | `get_datetime` | exact local date, time, weekday, timezone |
 | `calculate` | precise arithmetic (AST-evaluated, never `eval`) |
+| `convert_units` | length, mass, time, volume, data, speed, temperature |
+| `text_stats` | words, sentences, reading and speaking time, top terms |
+| `pick_random` | fair dice, coins, draws and picks — a model cannot do this itself |
 | `system_status` | live CPU, memory, disk, network, battery, uptime |
+| `list_processes` | what is actually eating this machine's CPU or RAM |
 | `remember` / `recall` | durable facts and search across every past session |
 | `take_note` / `list_notes` | free-form notes |
 | `set_reminder` / `list_reminders` | spoken reminders on a scheduler |
 | `list_directory` / `read_file` / `search_files` | the permitted workspace only |
+| `directory_size` | where the disk has gone, largest children first |
+| `write_file` / `list_scratch_files` | text files, in its own scratch folder only |
 | `run_command` | allow-listed read-only shell — **off** unless `JARVIS_ALLOW_SHELL=1` |
+| `web_search` | current results with links — **off** unless `JARVIS_ALLOW_NET=1` |
+| `get_weather` | conditions and a 3-day forecast — **off** unless `JARVIS_ALLOW_NET=1` |
 | `fetch_url` | readable page text — **off** unless `JARVIS_ALLOW_NET=1` |
 
-Safety posture: file reads are confined to `JARVIS_WORKSPACE` (default `~`) with
-a denylist for `.ssh`, `.aws`, `.env`, keychains and friends; **no skill writes
-files**; shell and network are opt-in; every invocation is audited to the memory
-store. `make smoke` asserts the sandbox actually refuses to escape.
+Safety posture, in four boundaries:
+
+* **Reads** are confined to `JARVIS_WORKSPACE` (default `~`) with a denylist for
+  `.ssh`, `.aws`, `.env`, keychains and friends.
+* **Writes** land only in `~/.jarvis/files`, text files only, and the path is
+  re-checked *after* resolution so neither `..` nor a planted symlink escapes.
+  Nothing the user already had can be overwritten.
+* **Shell** is off unless `JARVIS_ALLOW_SHELL=1`, and then only allow-listed
+  read-only verbs, argv-form, with a timeout.
+* **Network** is off unless `JARVIS_ALLOW_NET=1`, and then every URL is resolved
+  before the request and refused if it points at this machine or a private
+  network — otherwise "fetch a URL" reaches the cloud metadata endpoint, the
+  Ollama admin API on `:11434`, and everything else that trusts localhost.
+  Each redirect hop is re-checked, because a `302` would otherwise walk
+  straight past the first check.
+
+Every invocation is audited to the memory store and shown in the archive's
+**audit trail**. `make test` asserts each boundary refuses; `make smoke`
+asserts the sandbox refuses to escape against a running server.
 
 ### The reflex arc
 
@@ -239,8 +346,9 @@ speech-rate command.
 | --- | --- |
 | `/` | Focus the command bar |
 | `⌘P` / `Ctrl+P` | Command palette — every capability, fuzzy-searchable |
-| `⌘P` → `theme` | Four colour schemes; the WebGL scene cross-fades with the panels |
-| `Esc` | Barge-in — stop speaking |
+| `⌘P` → `theme` | Six colour schemes; the WebGL scene cross-fades with the panels |
+| `?` | Reference card — shortcuts, phrases and what is armed right now |
+| `Esc` | Barge-in — stop speaking, or close a panel |
 | `⌘K` / `Ctrl+K` | Toggle wake-word listening |
 | `↑` / `↓` | Command history |
 
@@ -260,8 +368,16 @@ unless you deliberately say the wake word to interrupt.
 ### End-to-end check
 
 ```bash
+make test           # pure-logic checks - no server, no model, no audio device
 make smoke          # health, vitals, settings, intents, barge-in, real audio
 ```
+
+`make test` covers the streamed-speech segmenter, which is the one part of the
+speech path that fails *silently*: a bad split does not raise, it just makes
+the assistant say "Dr" and then, half a second later, "Stark is in the lab".
+The checks feed it the same text at chunk sizes from one character to the whole
+string and assert nothing is lost, duplicated, or split inside an abbreviation,
+a decimal, or a URL.
 
 `smoke` asserts the audio stream is actually **audible** (non-trivial duration
 and peak amplitude) rather than merely present, so a silent regression fails
@@ -395,6 +511,8 @@ delta) or `{"type":"skill","name":…,"arguments":{…}}`; server sends:
 | `metrics` | Rolling latency / throughput window after every directive |
 | `tool` | One executed skill: name, arguments, result, duration |
 | `reminder` / `reminder.set` | A reminder fired, or was scheduled |
+| `model.pull` | Progress of a model download started from the interface |
+| `memory.changed` | Something in the durable store was erased — open archives reload |
 
 `/ws/audio` — server sends `tts.start` (engine, voice, sample_rate, text),
 `tts.chunk` (base64 int16 LE PCM, ~200 ms frames), `tts.end`, `tts.flush`
@@ -402,6 +520,11 @@ delta) or `{"type":"skill","name":…,"arguments":{…}}`; server sends:
 `{"type":"stop"}`. It is a **broadcast** bus — always match on `utterance_id`.
 
 ## Configuration (env)
+
+These are **first-boot** defaults. Anything you change from the interface is
+saved to `~/.jarvis/settings.json` and wins on every subsequent boot — see
+[Settings survive the restart](#settings-survive-the-restart). `DELETE
+/api/settings` erases the file and hands control back to the environment.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -413,13 +536,18 @@ delta) or `{"type":"skill","name":…,"arguments":{…}}`; server sends:
 | `JARVIS_PERSONA` | `jarvis` | Disposition preset |
 | `JARVIS_TOOLS` | `true` | Let the cortex call skills natively |
 | `JARVIS_TOOL_ROUNDS` | `4` | Model→tool→model round-trips per directive |
+| `JARVIS_OLLAMA_KEEP_ALIVE` | `30m` | How long Ollama holds the model in memory |
+| `JARVIS_PRELOAD` | `true` | Page the model in at boot and on every model switch |
+| `JARVIS_NUM_CTX` | `4096` | Context window sent to Ollama (`0` = server default) |
+| `JARVIS_NUM_PREDICT` | `512` | Ceiling on generated tokens per answer |
+| `JARVIS_OLLAMA_RETRIES` | `2` | Retries for a transient transport failure |
 | `JARVIS_RECALL` | `true` | Inject fragments of past sessions |
 | `JARVIS_RECALL_LIMIT` | `4` | Fragments injected per directive |
 | `JARVIS_PERSIST` | `true` | Write every turn to the on-disk store |
-| `JARVIS_DATA_DIR` | `~/.jarvis` | Where the memory database lives |
+| `JARVIS_DATA_DIR` | `~/.jarvis` | Memory database, saved settings, and the write scratch folder |
 | `JARVIS_WORKSPACE` | `~` | Root the file skills may never escape |
 | `JARVIS_ALLOW_SHELL` | `false` | Expose the allow-listed `run_command` skill |
-| `JARVIS_ALLOW_NET` | `false` | Expose the `fetch_url` skill |
+| `JARVIS_ALLOW_NET` | `false` | Expose `web_search`, `get_weather` and `fetch_url` |
 | `JARVIS_REMINDER_INTERVAL_S` | `20` | How often the reminder scheduler wakes |
 | `JARVIS_VOLUME` | `0.9` | Default playback gain |
 | `JARVIS_USE_CREWAI` | `false` | Use real CrewAI crew when installed |
@@ -429,6 +557,9 @@ delta) or `{"type":"skill","name":…,"arguments":{…}}`; server sends:
 | `JARVIS_TTS_QUALITY` | `fp32` | `fp32` / `q8` / `q4` … |
 | `JARVIS_TTS_SPEED` | `1.0` | Speech rate |
 | `JARVIS_TTS_WARMUP` | `true` | Pay ONNX session init at boot |
+| `JARVIS_STREAM_SPEECH` | `true` | Speak each sentence as it is written |
+| `JARVIS_SPEECH_FIRST_MAX_CHARS` | `150` | Longest opening fragment before it breaks at a clause |
+| `JARVIS_SPEECH_MAX_CHARS` | `240` | Longest fragment with no sentence end in it |
 | `JARVIS_OPERATOR` | `sir` | How the assistant addresses you |
 | `JARVIS_VITALS_INTERVAL_S` | `2.0` | Host metrics sample period |
 | `JARVIS_LOG_BACKLOG` | `60` | Log lines replayed to new clients |

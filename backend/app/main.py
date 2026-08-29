@@ -13,7 +13,15 @@ GET  /api/neural        the cognitive graph (nodes + edges) and live activation
 GET  /api/metrics       rolling latency / throughput window
 GET  /api/skills        the skill catalogue
 POST /api/skills/{name} invoke a skill directly (same path the cortex uses)
+GET  /api/models        the Ollama catalogue + any download in flight
+POST /api/models/pull   install a model without leaving the interface
+DELETE /api/models/pull cancel the download in flight
 GET  /api/personas      selectable dispositions
+GET  /api/sessions      past conversations, newest first
+GET  /api/sessions/{id} one conversation in full
+DELETE /api/sessions/{id}  erase one conversation
+GET  /api/events        the audit trail (tool invocations, by default)
+DELETE /api/settings    forget saved preferences
 GET  /api/memory        long-term memory statistics
 GET  /api/memory/search recall past exchanges by keyword
 GET  /api/memory/turns  recent exchanges
@@ -52,6 +60,7 @@ from .metrics import Metrics
 from .neural import NeuralBus
 from .orchestrator import Orchestrator
 from .personas import catalogue as persona_catalogue
+from .puller import ModelPuller
 from .registry import Registry
 from .skills import SkillKit, workspace_root
 from .telemetry import TelemetrySimulator
@@ -68,6 +77,7 @@ _registry.attach_engine(_engine)
 _neural = NeuralBus(_bus)
 _metrics = Metrics(_bus)
 _vitals = Vitals(_bus, client_provider=lambda: len(_bus.subscribers) + _tts.client_count)
+_puller = ModelPuller(_bus)
 
 try:
     _memory: Memory | None = Memory()
@@ -199,8 +209,19 @@ async def health() -> dict[str, Any]:
                 "available": _memory is not None,
                 "recall": _registry.recall,
             },
+            "ollama": {
+                "url": settings.ollama_base_url,
+                "reachable": bool(_registry.installed),
+                "installed": len(_registry.installed),
+                "keep_alive": settings.ollama_keep_alive,
+                "pulling": _puller.snapshot() if _puller.busy else None,
+            },
             "neural": {"nodes": len(_neural.nodes), "edges": len(_neural.edges),
                        "fired": _neural.fired},
+        },
+        "speech": {
+            "streaming": _registry.stream_speech,
+            "sample_rate": _engine.sample_rate,
         },
         "skills": len(_kit.skills) if _kit else 0,
         "clients": {"logs": len(_bus.subscribers), "audio": _tts.client_count},
@@ -240,6 +261,7 @@ async def post_settings(payload: dict) -> dict[str, Any]:
         tools=payload.get("tools"),
         recall=payload.get("recall"),
         volume=payload.get("volume"),
+        stream_speech=payload.get("stream_speech"),
     )
 
 
@@ -248,7 +270,9 @@ async def command(payload: dict) -> dict[str, Any]:
     text = str(payload.get("text", "")).strip()
     if not text:
         return {"ok": False, "error": "text required"}
-    await _orchestrator.enqueue(text, origin=str(payload.get("origin", "text")))
+    queued = await _orchestrator.enqueue_nowait(text, origin=str(payload.get("origin", "text")))
+    if not queued:
+        return {"ok": False, "error": "command queue is full - the assistant is still working"}
     return {"ok": True, "queued": text}
 
 
@@ -282,6 +306,38 @@ async def neural_graph() -> dict[str, Any]:
 @app.get("/api/metrics")
 async def metrics() -> dict[str, Any]:
     return _metrics.snapshot()
+
+
+@app.get("/api/models")
+async def models() -> dict[str, Any]:
+    """The Ollama catalogue plus whatever is being downloaded right now."""
+    await _registry.refresh_models()
+    return {
+        "ok": True,
+        "installed": _registry.installed,
+        "suggested": _registry.models,
+        "capabilities": _registry.capabilities,
+        "current": _registry.model,
+        "pull": _puller.snapshot(),
+    }
+
+
+@app.post("/api/models/pull")
+async def pull_model(payload: dict) -> dict[str, Any]:
+    """Install a model without leaving the interface. Progress streams to
+    /ws/logs as `model.pull` frames."""
+    async def finished(model: str, ok: bool) -> None:
+        await _registry.refresh_models()
+        if ok and not _registry.model_verified:
+            _registry.apply(model=model)
+        _registry.broadcast()
+
+    return _puller.start(str(payload.get("model", "")), on_done=finished)
+
+
+@app.delete("/api/models/pull")
+async def cancel_pull() -> dict[str, Any]:
+    return {"ok": _puller.cancel()}
 
 
 @app.get("/api/personas")
@@ -330,6 +386,56 @@ def _no_memory() -> dict[str, Any]:
     return {"ok": False, "error": "long-term memory unavailable"}
 
 
+@app.get("/api/sessions")
+async def sessions(limit: int = 50) -> dict[str, Any]:
+    """Every past conversation, so the archive can be browsed rather than
+    only searched — you rarely remember the keyword, you remember the day."""
+    if _memory is None:
+        return _no_memory()
+    rows = await asyncio.to_thread(_memory.sessions, max(1, min(200, limit)))
+    return {"ok": True, "current": _memory.session_id, "sessions": rows}
+
+
+@app.get("/api/sessions/{session_id}")
+async def session_detail(session_id: int, limit: int = 500) -> dict[str, Any]:
+    if _memory is None:
+        return _no_memory()
+    turns = await asyncio.to_thread(_memory.session_turns, session_id, limit)
+    if not turns:
+        return {"ok": False, "error": f"session {session_id} has nothing recorded"}
+    return {"ok": True, "session_id": session_id, "turns": turns}
+
+
+@app.delete("/api/sessions/{session_id}")
+async def session_delete(session_id: int) -> dict[str, Any]:
+    if _memory is None:
+        return _no_memory()
+    removed = await asyncio.to_thread(_memory.delete_session, session_id)
+    _bus.publish("warn", "memory", f"session {session_id} erased - {removed} turn(s)")
+    _bus.push_frame({"type": "memory.changed", "reason": "session.delete"})
+    return {"ok": True, "removed": removed}
+
+
+@app.get("/api/events")
+async def events(kind: str = "tool", limit: int = 100) -> dict[str, Any]:
+    """The audit trail. Every skill invocation is recorded whether the model
+    called it or the operator did, so there is an after-the-fact record of
+    what the assistant actually did on this machine."""
+    if _memory is None:
+        return _no_memory()
+    rows = await asyncio.to_thread(_memory.events, kind or None, max(1, min(500, limit)))
+    return {"ok": True, "kind": kind, "events": rows}
+
+
+@app.delete("/api/settings")
+async def forget_settings() -> dict[str, Any]:
+    """Erase the saved preference file. The live session keeps its current
+    settings; the *next* boot falls back to the environment defaults."""
+    ok = _registry.forget_prefs()
+    _registry.broadcast()
+    return {"ok": ok, "settings": _registry.as_dict()}
+
+
 @app.get("/api/memory")
 async def memory_stats() -> dict[str, Any]:
     if _memory is None:
@@ -361,6 +467,7 @@ async def memory_wipe() -> dict[str, Any]:
         return _no_memory()
     removed = await asyncio.to_thread(_memory.forget_all)
     _bus.publish("warn", "memory", f"long-term memory erased via API - {removed} turn(s)")
+    _bus.push_frame({"type": "memory.changed", "reason": "memory.wipe"})
     return {"ok": True, "removed": removed}
 
 
@@ -517,7 +624,10 @@ async def _logs_receiver(ws: WebSocket) -> None:
             text = str(message.get("text", "")).strip()
             origin = str(message.get("origin", "text"))
             if text:
-                await _orchestrator.enqueue(text, origin)
+                # nowait: a full queue must drop the directive with a warning
+                # rather than block this socket's receive loop, which would
+                # also stall barge-in and settings frames from the same client.
+                await _orchestrator.enqueue_nowait(text, origin)
         elif mtype == "ping":
             await ws.send_json({"type": "pong", "ts": message.get("ts", time.time())})
         elif mtype == "stop":
@@ -529,6 +639,7 @@ async def _logs_receiver(ws: WebSocket) -> None:
                 speed=message.get("speed"), think=message.get("think"),
                 persona=message.get("persona"), tools=message.get("tools"),
                 recall=message.get("recall"), volume=message.get("volume"),
+                stream_speech=message.get("stream_speech"),
             )
         elif mtype == "skill":
             name = str(message.get("name", "")).strip()

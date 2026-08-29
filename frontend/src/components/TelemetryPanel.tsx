@@ -293,6 +293,24 @@ export default function TelemetryPanel() {
         <span className="telemetry-header-actions">
           <button
             className="gear"
+            onClick={() => useJarvis.getState().setOverlay("archive")}
+            title="Archive — past conversations & audit trail"
+            aria-label="Open the archive"
+            type="button"
+          >
+            ⌗
+          </button>
+          <button
+            className="gear"
+            onClick={() => useJarvis.getState().setOverlay("help")}
+            title="Reference card — shortcuts & phrases (?)"
+            aria-label="Open the reference card"
+            type="button"
+          >
+            ?
+          </button>
+          <button
+            className="gear"
             onClick={() => useJarvis.getState().setSettingsOpen(true)}
             title="Settings (or say “settings”)"
             aria-label="Open settings"

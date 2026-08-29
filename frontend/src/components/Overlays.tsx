@@ -1,15 +1,18 @@
 "use client";
 
 /**
- * Secondary views that deserve room to breathe: the performance history and
- * the skill catalogue. Both open from the instrument bar or the command
- * palette, and both close on Escape or a click outside.
+ * Secondary views that deserve room to breathe: the performance history, the
+ * skill catalogue, the cognitive map, the conversation archive and the
+ * reference card. All open from the instrument bar or the command palette,
+ * and all close on Escape or a click outside.
  *
  * The settings panel keeps its own component because the backend can open it
- * by voice; these two are interface-only.
+ * by voice; these are interface-only.
  */
 
 import { useEffect, useRef, useState } from "react";
+import Archive from "./Archive";
+import HelpView from "./HelpView";
 import { sendSkill } from "@/hooks/useJarvisConnection";
 import { REGION_COLOR, REGION_ORDER, neural } from "@/state/neural";
 import { useJarvis } from "@/state/jarvis";
@@ -62,9 +65,16 @@ function MetricsView() {
     <>
       <div className="stat-grid">
         <div className="stat">
-          <span className="stat-label">FIRST WORD p50</span>
+          <span className="stat-label">FIRST TOKEN p50</span>
           <span className="stat-value">{ms(metrics.ttft_ms.p50)}</span>
           <span className="stat-sub">p95 {ms(metrics.ttft_ms.p95)}</span>
+        </div>
+        {/* The token is when the model starts; this is when the operator
+            actually hears something, which is the figure worth optimising. */}
+        <div className="stat">
+          <span className="stat-label">FIRST WORD SPOKEN p50</span>
+          <span className="stat-value">{ms(metrics.ttfa_ms?.p50 ?? 0)}</span>
+          <span className="stat-sub">p95 {ms(metrics.ttfa_ms?.p95 ?? 0)}</span>
         </div>
         <div className="stat">
           <span className="stat-label">FULL ANSWER p50</span>
@@ -109,8 +119,14 @@ function MetricsView() {
             <b>
               {last.kind} · {last.mode} · {last.model}
             </b>
-            <span>first word</span>
+            <span>first token</span>
             <b>{ms(last.ttft_ms)}</b>
+            {last.ttfa_ms !== null && last.ttfa_ms !== undefined && (
+              <>
+                <span>first word spoken</span>
+                <b>{ms(last.ttfa_ms)}</b>
+              </>
+            )}
             <span>composed</span>
             <b>{ms(last.total_ms)}</b>
             {last.voice_ms !== null && (
@@ -143,6 +159,7 @@ const DANGER_NOTE: Record<string, string> = {
   reads_files: "reads files inside the permitted workspace",
   executes: "runs an allow-listed shell command",
   network: "makes a network request",
+  writes_files: "writes into the assistant's own scratch folder only",
 };
 
 function SkillsView() {
@@ -300,19 +317,25 @@ export default function Overlays() {
     return () => window.removeEventListener("keydown", onKey);
   }, [overlay, setOverlay]);
 
-  if (overlay !== "metrics" && overlay !== "skills" && overlay !== "neural") return null;
-
-  const title =
-    overlay === "metrics"
-      ? "PERFORMANCE"
-      : overlay === "skills"
-        ? "SKILL CATALOGUE"
-        : "COGNITIVE MAP";
+  const TITLES: Partial<Record<typeof overlay, string>> = {
+    metrics: "PERFORMANCE",
+    skills: "SKILL CATALOGUE",
+    neural: "COGNITIVE MAP",
+    archive: "ARCHIVE",
+    help: "REFERENCE",
+  };
+  const title = TITLES[overlay];
+  if (!title) return null;
 
   return (
     <>
       <div className="settings-scrim" onClick={() => setOverlay("none")} />
-      <section className="overlay-panel" role="dialog" aria-label={title}>
+      <section
+        className="overlay-panel"
+        role="dialog"
+        aria-label={title}
+        data-overlay={overlay}
+      >
         <header className="telemetry-header">
           <span className="telemetry-title">{title}</span>
           <button
@@ -328,6 +351,8 @@ export default function Overlays() {
           {overlay === "metrics" && <MetricsView />}
           {overlay === "skills" && <SkillsView />}
           {overlay === "neural" && <NeuralView />}
+          {overlay === "archive" && <Archive />}
+          {overlay === "help" && <HelpView />}
         </div>
       </section>
     </>

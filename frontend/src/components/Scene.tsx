@@ -22,12 +22,14 @@
  * re-renders the WebGL tree.
  */
 
-import { useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { AdaptiveDpr } from "@react-three/drei";
 import * as THREE from "three";
 import { audioEngine } from "@/audio/engine";
 import { audioLevels, BAND_COUNT, WAVE_COUNT } from "@/audio/levels";
+import { initQuality, lowerTier, onQualityChange, profile, quality, setQuality } from "@/state/quality";
+import { useJarvis } from "@/state/jarvis";
 import NeuralMesh from "./NeuralMesh";
 import { sceneColors, stepSceneTheme } from "@/state/theme";
 
@@ -145,7 +147,7 @@ function Starfield() {
   const group = useRef<THREE.Points>(null);
   const material = useRef<THREE.PointsMaterial>(null);
   const geometry = useMemo(() => {
-    const count = 520;
+    const count = profile().stars;
     const positions = new Float32Array(count * 3);
     for (let i = 0; i < count; i++) {
       // Shell well behind the core so it parallaxes rather than intersects.
@@ -205,7 +207,8 @@ function Cage() {
 
 /* ---------- particle core (GPU displacement) ---------- */
 
-const CORE_COUNT = 24000;
+//: The full-fat point count. `profile().particles` steps it down on hardware
+//: that cannot sustain it - see state/quality.ts.
 const CORE_RADIUS = 1.22;
 
 const CORE_VERT = /* glsl */ `
@@ -276,10 +279,11 @@ function ParticleCore() {
   const smooth = useRef({ scale: 1 });
 
   const { geometry, material } = useMemo(() => {
-    const positions = fibonacciSphere(CORE_COUNT, CORE_RADIUS, 0.05);
-    const phaseA = new Float32Array(CORE_COUNT);
-    const phaseB = new Float32Array(CORE_COUNT);
-    for (let i = 0; i < CORE_COUNT; i++) {
+    const count = profile().particles;
+    const positions = fibonacciSphere(count, CORE_RADIUS, 0.05);
+    const phaseA = new Float32Array(count);
+    const phaseB = new Float32Array(count);
+    for (let i = 0; i < count; i++) {
       phaseA[i] = Math.random();
       phaseB[i] = Math.random();
     }
@@ -832,16 +836,84 @@ function CameraRig() {
   return null;
 }
 
+/* ---------- performance guard ---------- */
+
+/**
+ * Watches the real frame rate and steps the quality tier down if the device
+ * cannot keep up.
+ *
+ * Deliberately conservative: it samples over whole seconds (a single slow
+ * frame means nothing - a garbage collection, a tab regaining focus), ignores
+ * the first two seconds while shaders compile and the ONNX voice warms, and
+ * demotes at most once per session so it can never oscillate. It also does not
+ * touch React state per frame; `quality.fps` is a plain field that panels read
+ * when they happen to render.
+ */
+function PerfGuard({ onDemote }: { onDemote: (tier: string) => void }) {
+  const frames = useRef(0);
+  const since = useRef(0);
+  const slowSeconds = useRef(0);
+  const elapsed = useRef(0);
+
+  useFrame((_, dt) => {
+    elapsed.current += dt;
+    frames.current += 1;
+    since.current += dt;
+    if (since.current < 1) return;
+
+    const fps = frames.current / since.current;
+    quality.fps = Math.round(fps);
+    frames.current = 0;
+    since.current = 0;
+
+    // Shader compilation and texture upload dominate the opening second.
+    if (elapsed.current < 3) return;
+    if (!quality.auto || quality.demoted) return;
+
+    slowSeconds.current = fps < 38 ? slowSeconds.current + 1 : 0;
+    if (slowSeconds.current < 4) return;
+
+    const next = lowerTier(quality.tier);
+    slowSeconds.current = 0;
+    if (!next) {
+      // Already at the bottom; stop measuring against a target we cannot meet.
+      quality.demoted = true;
+      return;
+    }
+    quality.demoted = true;
+    setQuality(next, true);
+    onDemote(next);
+  });
+
+  return null;
+}
+
 /* ---------- scene root ---------- */
 
 export default function Scene() {
+  // Resolved once, before the renderer is constructed: `antialias` and the dpr
+  // clamp are baked into the WebGL context, so a tier change has to remount the
+  // canvas. The `key` below is what makes that happen.
+  const [tier, setTier] = useState(() => initQuality());
+  const settings = profile();
+
+  useEffect(() => onQualityChange((next) => setTier(next)), []);
+
   return (
     <Canvas
+      key={tier}
       className="scene-canvas"
-      dpr={[1, 2]}
-      gl={{ antialias: true, alpha: true, powerPreference: "high-performance" }}
+      dpr={settings.dpr}
+      gl={{ antialias: settings.antialias, alpha: true, powerPreference: "high-performance" }}
       camera={{ fov: 44, position: [0, 0.18, 7.6], near: 0.1, far: 80 }}
     >
+      <PerfGuard
+        onDemote={(next) =>
+          useJarvis
+            .getState()
+            .pushLog("warn", "render", `frame rate below target - scene quality lowered to ${next}`)
+        }
+      />
       <AdaptiveDpr pixelated={false} />
       <CameraRig />
       <Starfield />

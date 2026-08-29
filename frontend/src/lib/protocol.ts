@@ -63,6 +63,12 @@ export interface SettingsState {
   recall: boolean;
   /** playback gain 0..1 */
   volume: number;
+  /** speak each sentence as it is written, rather than waiting for the answer */
+  stream_speech: boolean;
+  /** which settings are saved to disk and will be restored on the next boot */
+  persisted?: string[];
+  /** where that preference file lives */
+  prefs_path?: string;
 }
 
 export interface Vitals {
@@ -173,6 +179,8 @@ export interface MetricsRun {
   mode: string;
   kind: string;
   ttft_ms: number;
+  /** time to the first *spoken* word - what the operator actually waits for */
+  ttfa_ms: number | null;
   total_ms: number;
   voice_ms: number | null;
   tok_s: number;
@@ -191,10 +199,18 @@ export interface MetricsFrame {
   spoken_chars: number;
   uptime_s: number;
   ttft_ms: MetricsBand;
+  ttfa_ms?: MetricsBand;
   total_ms: MetricsBand;
   tok_s: { avg: number; best: number; last: number };
   last: MetricsRun | null;
-  history: Array<{ ttft_ms: number; total_ms: number; tok_s: number; kind: string; error: boolean }>;
+  history: Array<{
+    ttft_ms: number;
+    ttfa_ms?: number | null;
+    total_ms: number;
+    tok_s: number;
+    kind: string;
+    error: boolean;
+  }>;
 }
 
 /** One executed skill, as it happens. */
@@ -206,6 +222,19 @@ export interface ToolFrame {
   detail: string;
   elapsed_ms: number;
   ts: number;
+}
+
+/** Progress of an `ollama pull` started from the interface. */
+export interface ModelPullFrame {
+  type: "model.pull";
+  model: string;
+  status?: string;
+  completed?: number;
+  total?: number;
+  percent?: number | null;
+  done: boolean;
+  ok?: boolean;
+  detail?: string;
 }
 
 export interface ReminderFrame {
@@ -258,6 +287,12 @@ export interface TranscriptFrame {
   text: string;
 }
 
+/** Something in the durable store changed underneath any open archive view. */
+export interface MemoryChangedFrame {
+  type: "memory.changed";
+  reason: string;
+}
+
 export interface UiFrame {
   type: "ui";
   action: "open_settings" | "close_settings" | "clear_logs" | "clear_transcript" | string;
@@ -277,8 +312,10 @@ export type LogsServerFrame =
   | NeuralGraphFrame
   | NeuralFrame
   | MetricsFrame
+  | ModelPullFrame
   | ToolFrame
   | ReminderFrame
+  | MemoryChangedFrame
   | { type: "pong"; ts?: number };
 
 export interface CommandFrame {
@@ -298,6 +335,7 @@ export interface SettingsCommandFrame {
   tools?: boolean;
   recall?: boolean;
   volume?: number;
+  stream_speech?: boolean;
 }
 
 /** Invoke a skill by hand from the interface. */

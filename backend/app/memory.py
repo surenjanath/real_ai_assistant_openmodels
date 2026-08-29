@@ -232,6 +232,75 @@ class Memory:
         scored.sort(key=lambda r: r.score, reverse=True)
         return scored[:limit]
 
+    # -- sessions ------------------------------------------------------------
+
+    def title_session(self, text: str, session_id: int | None = None) -> None:
+        """Name a session after the first thing said in it.
+
+        Only ever sets a title that is still empty, so the opening directive
+        names the conversation and nothing later overwrites it.
+        """
+        title = " ".join(str(text).split())[:80]
+        if not title:
+            return
+        self.db.execute(
+            "UPDATE sessions SET title=? WHERE id=? AND (title IS NULL OR title='')",
+            (title, session_id if session_id is not None else self.session_id),
+        )
+        self.db.commit()
+
+    def sessions(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Past conversations, newest first, with their size and span.
+
+        Empty sessions are excluded: every process start opens one, so a
+        machine that has been rebooted a few times would otherwise show a list
+        of conversations that never happened.
+        """
+        rows = self.db.execute(
+            "SELECT s.id, s.started_at, s.ended_at, s.title, "
+            "       COUNT(t.id) AS turns, MIN(t.ts) AS first_ts, MAX(t.ts) AS last_ts "
+            "FROM sessions s JOIN turns t ON t.session_id = s.id "
+            "GROUP BY s.id HAVING turns > 0 ORDER BY s.id DESC LIMIT ?",
+            (max(1, min(200, limit)),),
+        ).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            item["current"] = item["id"] == self.session_id
+            if not item.get("title"):
+                # Fall back to the first thing the operator said in it, so a
+                # session recorded before titling existed still reads as
+                # something rather than as "Session 12".
+                first = self.db.execute(
+                    "SELECT text FROM turns WHERE session_id=? AND role='user' "
+                    "ORDER BY id LIMIT 1", (item["id"],),
+                ).fetchone()
+                item["title"] = (" ".join(first["text"].split())[:80] if first else "")
+            out.append(item)
+        return out
+
+    def session_turns(self, session_id: int, limit: int = 500) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT id, role, text, ts, model, latency_ms, origin FROM turns "
+            "WHERE session_id=? ORDER BY id LIMIT ?",
+            (int(session_id), max(1, min(2000, limit))),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_session(self, session_id: int) -> int:
+        """Erase one conversation and everything recorded inside it."""
+        session_id = int(session_id)
+        removed = int(self.db.execute(
+            "SELECT COUNT(*) FROM turns WHERE session_id=?", (session_id,)
+        ).fetchone()[0])
+        self.db.execute("DELETE FROM turns WHERE session_id=?", (session_id,))
+        # The live session's row must survive: `add_turn` has a foreign key on
+        # it in spirit, and deleting it would orphan the rest of this run.
+        if session_id != self.session_id:
+            self.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+        self.db.commit()
+        return removed
+
     def stats(self) -> dict[str, Any]:
         def count(table: str, where: str = "") -> int:
             return int(self.db.execute(f"SELECT COUNT(*) FROM {table} {where}").fetchone()[0])
@@ -239,7 +308,10 @@ class Memory:
         first = self.db.execute("SELECT MIN(ts) FROM turns").fetchone()[0]
         return {
             "turns": count("turns"),
-            "sessions": count("sessions"),
+            # Only sessions that actually contain something: a restart opens a
+            # row whether or not anyone speaks, and counting those inflates
+            # "conversations remembered" every time the process bounces.
+            "sessions": count("sessions", "WHERE id IN (SELECT DISTINCT session_id FROM turns)"),
             "facts": count("facts"),
             "notes": count("notes"),
             "reminders": count("reminders", "WHERE fired=0"),
@@ -275,13 +347,18 @@ class Memory:
 
     def recall_fact(self, key: str) -> str | None:
         key = key.strip().lower()
-        row = self.db.execute("SELECT value FROM facts WHERE key=?", (key,)).fetchone()
+        # Select the matched row's own key, not the lookup term: a fuzzy hit
+        # ("sister" matching "sister's name") would otherwise credit the hit to
+        # a key that does not exist, so the counter stayed at zero forever and
+        # `hits` was useless as a signal of what actually gets recalled.
+        row = self.db.execute("SELECT key, value FROM facts WHERE key=?", (key,)).fetchone()
         if row is None:
             row = self.db.execute(
-                "SELECT value FROM facts WHERE key LIKE ? ORDER BY ts DESC LIMIT 1", (f"%{key}%",)
+                "SELECT key, value FROM facts WHERE key LIKE ? ORDER BY ts DESC LIMIT 1",
+                (f"%{key}%",),
             ).fetchone()
         if row is not None:
-            self.db.execute("UPDATE facts SET hits=hits+1 WHERE key=?", (key,))
+            self.db.execute("UPDATE facts SET hits=hits+1 WHERE key=?", (row["key"],))
             self.db.commit()
             return str(row["value"])
         return None

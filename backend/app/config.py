@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from . import __version__
+
 
 def _env(key: str, default: str) -> str:
     value = os.environ.get(f"JARVIS_{key}")
@@ -42,7 +44,8 @@ class Settings:
 
     # --- Identity / telemetry -------------------------------------------
     name: str = field(default_factory=lambda: _env("NAME", "J.A.R.V.I.S."))
-    version: str = "1.3.0"
+    #: mirrors `app.__version__`; never define a second copy here
+    version: str = __version__
     operator: str = field(default_factory=lambda: _env("OPERATOR", "sir"))
     log_backlog: int = field(default_factory=lambda: _env_int("LOG_BACKLOG", 60))
     heartbeat_min_s: float = field(default_factory=lambda: _env_int("HEARTBEAT_MIN_S", 6))
@@ -68,6 +71,19 @@ class Settings:
     tools: bool = field(default_factory=lambda: _env_bool("TOOLS", True))
     #: how many tool round-trips one directive may spend
     tool_rounds: int = field(default_factory=lambda: _env_int("TOOL_ROUNDS", 4))
+    #: how long Ollama keeps the model resident after a request. Reloading a
+    #: 8B model costs 2-10s, which is the single largest source of a slow
+    #: first answer; "30m" keeps it warm through a whole working session.
+    ollama_keep_alive: str = field(default_factory=lambda: _env("OLLAMA_KEEP_ALIVE", "30m"))
+    #: preload the model into VRAM at boot / on model switch, so the first
+    #: directive never pays the load cost
+    preload: bool = field(default_factory=lambda: _env_bool("PRELOAD", True))
+    #: context window handed to Ollama; 0 leaves the server default alone
+    num_ctx: int = field(default_factory=lambda: _env_int("NUM_CTX", 4096))
+    #: hard ceiling on generated tokens - a runaway answer is a hung assistant
+    num_predict: int = field(default_factory=lambda: _env_int("NUM_PREDICT", 512))
+    #: retries for a transient Ollama transport failure
+    ollama_retries: int = field(default_factory=lambda: _env_int("OLLAMA_RETRIES", 2))
 
     # --- Durable memory (Phase 6) -----------------------------------------
     #: inject relevant fragments of past sessions into the prompt
@@ -97,6 +113,22 @@ class Settings:
     tts_max_chars: int = field(default_factory=lambda: _env_int("TTS_MAX_CHARS", 1800))
     #: default interface playback gain, 0..1
     volume: float = field(default_factory=lambda: _env_float("VOLUME", 0.9))
+    #: speak each sentence as the model finishes it, rather than waiting for
+    #: the whole answer. Cuts time-to-first-word to roughly one sentence of
+    #: generation instead of the full completion.
+    stream_speech: bool = field(default_factory=lambda: _env_bool("STREAM_SPEECH", True))
+    #: shortest fragment worth handing to the vocal engine on its own
+    speech_min_chars: int = field(default_factory=lambda: _env_int("SPEECH_MIN_CHARS", 12))
+    #: force a break at a soft boundary once a fragment grows past this
+    speech_max_chars: int = field(default_factory=lambda: _env_int("SPEECH_MAX_CHARS", 240))
+    #: The *first* fragment is allowed to break at a clause boundary (a comma,
+    #: a dash) rather than waiting for a full stop. Kokoro only emits audio at
+    #: the end of a whole sentence, so with 35-word sentences the opening
+    #: fragment alone can cost several seconds of silence. Breaking it early
+    #: gets the assistant talking; by the time that clause has been spoken the
+    #: rest of the answer is long since synthesised.
+    speech_first_min_chars: int = field(default_factory=lambda: _env_int("SPEECH_FIRST_MIN_CHARS", 40))
+    speech_first_max_chars: int = field(default_factory=lambda: _env_int("SPEECH_FIRST_MAX_CHARS", 150))
 
     # --- Server ------------------------------------------------------------
     cors_origins: str = field(default_factory=lambda: _env("CORS_ORIGINS", "*"))

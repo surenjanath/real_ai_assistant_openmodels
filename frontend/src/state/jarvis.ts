@@ -14,6 +14,7 @@ import type {
   LogLine,
   MemoryStats,
   MetricsFrame,
+  ModelPullFrame,
   SettingsState,
   SkillInfo,
   ToolFrame,
@@ -24,13 +25,31 @@ import type {
 const MAX_LOGS = 220;
 const MAX_TURNS = 60;
 const MAX_TOOLS = 40;
+const MAX_TOASTS = 4;
+
+/** A transient notice: something the operator should see even if the telemetry
+ *  panel is scrolled away or covered by an overlay. */
+export interface Toast {
+  id: number;
+  kind: "error" | "warn" | "success" | "info";
+  title: string;
+  detail: string;
+  ts: number;
+}
 
 /** Colour schemes, applied by stamping `data-theme` on <html>. */
-export const THEMES = ["arc", "crimson", "emerald", "amber"] as const;
+export const THEMES = ["arc", "crimson", "emerald", "amber", "violet", "mono"] as const;
 export type Theme = (typeof THEMES)[number];
 
 /** Which overlay panel, if any, is open. */
-export type Overlay = "none" | "settings" | "skills" | "metrics" | "neural";
+export type Overlay =
+  | "none"
+  | "settings"
+  | "skills"
+  | "metrics"
+  | "neural"
+  | "archive"
+  | "help";
 
 interface Engines {
   tts: string;
@@ -65,6 +84,12 @@ interface JarvisState {
   tools: ToolFrame[];
   metrics: MetricsFrame | null;
   memoryStats: MemoryStats | null;
+  /** bumped whenever the durable store changes underneath an open view, so
+   *  the archive reloads instead of showing a conversation that is gone */
+  memoryVersion: number;
+  /** progress of a model download started from the interface */
+  pull: ModelPullFrame | null;
+  toasts: Toast[];
   logsConnected: boolean;
   audioConnected: boolean;
   audioUnlocked: boolean;
@@ -90,6 +115,10 @@ interface JarvisState {
   pushTool: (tool: ToolFrame) => void;
   setMetrics: (metrics: MetricsFrame) => void;
   setMemoryStats: (stats: MemoryStats) => void;
+  bumpMemoryVersion: () => void;
+  setPull: (pull: ModelPullFrame | null) => void;
+  pushToast: (kind: Toast["kind"], title: string, detail?: string) => void;
+  dismissToast: (id: number) => void;
   setConnected: (socket: "logs" | "audio", connected: boolean) => void;
   setAudioUnlocked: (unlocked: boolean) => void;
   setLatency: (ms: number | null) => void;
@@ -104,6 +133,7 @@ interface JarvisState {
 
 let logId = 0;
 let turnId = 0;
+let toastId = 0;
 
 export const useJarvis = create<JarvisState>((set) => ({
   status: "boot",
@@ -133,6 +163,8 @@ export const useJarvis = create<JarvisState>((set) => ({
     tools_active: false,
     recall: true,
     volume: 0.9,
+    stream_speech: true,
+    persisted: [],
   },
   vitals: null,
   settingsOpen: false,
@@ -146,6 +178,9 @@ export const useJarvis = create<JarvisState>((set) => ({
   tools: [],
   metrics: null,
   memoryStats: null,
+  memoryVersion: 0,
+  pull: null,
+  toasts: [],
   logsConnected: false,
   audioConnected: false,
   audioUnlocked: false,
@@ -233,6 +268,19 @@ export const useJarvis = create<JarvisState>((set) => ({
 
   setMetrics: (metrics) => set({ metrics }),
   setMemoryStats: (memoryStats) => set({ memoryStats }),
+  bumpMemoryVersion: () => set((state) => ({ memoryVersion: state.memoryVersion + 1 })),
+  setPull: (pull) => set({ pull }),
+
+  pushToast: (kind, title, detail = "") =>
+    set((state) => {
+      // Never stack the same notice twice - a failing subsystem logs in a
+      // tight loop and would otherwise bury the screen in identical cards.
+      if (state.toasts.some((t) => t.title === title && t.detail === detail)) return state;
+      const toast: Toast = { id: ++toastId, kind, title, detail, ts: Date.now() };
+      return { toasts: [...state.toasts, toast].slice(-MAX_TOASTS) };
+    }),
+
+  dismissToast: (id) => set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) })),
 
   setConnected: (socket, connected) =>
     set(socket === "logs" ? { logsConnected: connected } : { audioConnected: connected }),

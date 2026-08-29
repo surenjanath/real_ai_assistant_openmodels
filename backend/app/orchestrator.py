@@ -23,6 +23,7 @@ Three cross-cutting subsystems ride along:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from datetime import datetime
 from typing import Any
@@ -81,15 +82,22 @@ class Orchestrator:
         self.runtime: Runtime | None = None
         self._lock = asyncio.Lock()  # serialise workflows - one crew at a time
         self._worker: asyncio.Task | None = None
+        self._watchdog: asyncio.Task | None = None
         self._reminders: asyncio.Task | None = None
         self._queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=16)
         self._last_answer = ""
         self._run: Run | None = None
         #: row id of the directive currently being answered, kept out of its own recall
         self._live_turn_id: int | None = None
+        #: open voice stream for the answer being generated, if any
+        self._voice: Any | None = None
 
     async def start(self) -> None:
         await self.registry.refresh_models()
+        # Capability-dependent preferences (think / tools) were restored from
+        # disk before the catalogue existed; now that it does, stand down
+        # anything the loaded model cannot actually do.
+        self.registry.reconcile()
         runtime = await OllamaRuntime.probe(
             self.bus, registry=self.registry, kit=self.kit, neural=self.neural
         )
@@ -107,18 +115,34 @@ class Orchestrator:
             runtime.vitals_provider = self.vitals_provider
             if self.memory is not None:
                 runtime.context_provider = self._recall_context
+            # Warm the weights now and whenever the operator switches model,
+            # so no directive ever pays the page-in cost.
+            self.registry.on_model_change = self._on_model_change
+            if settings.preload:
+                asyncio.create_task(runtime.preload(), name="preload")
         self.runtime = runtime
         self._worker = asyncio.create_task(self._worker_loop(), name="orchestrator")
+        self._watchdog = asyncio.create_task(self._supervise(), name="orchestrator-watchdog")
         if self.memory is not None:
             self._reminders = asyncio.create_task(self._reminder_loop(), name="reminders")
 
+    def _on_model_change(self, tag: str) -> None:
+        """Page the newly selected model in, off the critical path."""
+        runtime = self.runtime
+        if not settings.preload or not hasattr(runtime, "preload"):
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        asyncio.create_task(runtime.preload(tag), name=f"preload-{tag}")
+
     async def stop(self) -> None:
-        for task in (self._worker, self._reminders):
+        tasks = (self._watchdog, self._worker, self._reminders)
+        for task in tasks:
             if task:
                 task.cancel()
-        await asyncio.gather(
-            *[t for t in (self._worker, self._reminders) if t], return_exceptions=True
-        )
+        await asyncio.gather(*[t for t in tasks if t], return_exceptions=True)
 
     @property
     def runtime_name(self) -> str:
@@ -128,17 +152,64 @@ class Orchestrator:
     def mode(self) -> str:
         return getattr(self.runtime, "mode", "simulated")
 
-    async def enqueue(self, text: str, origin: str = "text") -> None:
-        await self._queue.put((text, origin))
+    async def enqueue_nowait(self, text: str, origin: str = "text") -> bool:
+        """Queue a directive without blocking; False when the queue is full."""
+        try:
+            self._queue.put_nowait((text, origin))
+        except asyncio.QueueFull:
+            self.bus.publish("warn", "workflow", "command queue full - directive dropped")
+            return False
+        return True
 
     async def _worker_loop(self) -> None:
+        """Drain the directive queue forever.
+
+        Nothing raised by a single directive may take the loop down with it -
+        if this task dies the assistant goes permanently deaf while still
+        looking perfectly healthy, which is the worst failure mode available.
+        `handle` already guards itself; the outer guard covers everything else
+        (cancellation excepted), and `_supervise` restarts the task if even
+        that is somehow escaped.
+        """
         while True:
             text, origin = await self._queue.get()
             try:
                 await self.handle(text, origin)
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:  # noqa: BLE001 - never kill the worker
                 self.bus.publish("error", "workflow", f"orchestrator error: {type(exc).__name__}: {exc}")
-                self._broadcast_status("idle")
+                self._reset_after_failure()
+
+    def _reset_after_failure(self) -> None:
+        """Return the assistant to a state where the next directive can work."""
+        voice, self._voice = self._voice, None
+        if voice is not None:
+            with contextlib.suppress(Exception):
+                voice.abort()
+        if self._run is not None and self.metrics is not None:
+            self._run.error = self._run.error or "orchestrator"
+            with contextlib.suppress(Exception):
+                self.metrics.finish(self._run)
+        self._run = None
+        self._broadcast_status("idle")
+
+    async def _supervise(self) -> None:
+        """Restart the worker if it ever stops - see `_worker_loop`."""
+        while True:
+            await asyncio.sleep(5.0)
+            worker = self._worker
+            if worker is None or not worker.done():
+                continue
+            if worker.cancelled():
+                return
+            exc = worker.exception()
+            self.bus.publish(
+                "error", "workflow",
+                f"command worker died ({type(exc).__name__ if exc else 'exit'}) - restarting",
+            )
+            self._reset_after_failure()
+            self._worker = asyncio.create_task(self._worker_loop(), name="orchestrator")
 
     # -- durable recall --------------------------------------------------------
 
@@ -184,6 +255,24 @@ class Orchestrator:
 
     # -- streaming answer ------------------------------------------------------
 
+    def _first_audio(self, run: Run | None):
+        """Stamp — and immediately report — the moment speech actually starts.
+
+        The run itself is not closed until playback ends, which for a long
+        answer is half a minute later. Without this interim broadcast the
+        instrument bar would spend that entire time showing the fallback
+        (time to first *token*) under a label that says FIRST WORD.
+        """
+        if run is None:
+            return None
+
+        def mark() -> None:
+            run.mark_first_audio()
+            if self.metrics is not None:
+                self.metrics.publish(run)
+
+        return mark
+
     def _emit_delta(self, delta: str) -> None:
         """Called from the model worker thread as answer tokens arrive."""
         if self._run is not None:
@@ -191,10 +280,20 @@ class Orchestrator:
         if self.neural is not None:
             self.neural.fire("out.answer", 0.25)
         self.bus.push_frame({"type": "answer.delta", "text": delta})
+        # Hand each closed sentence to the vocal engine while the model keeps
+        # writing, so speech starts a sentence into the answer rather than
+        # after it. `feed` is thread-safe by design - we are off-loop here.
+        voice = self._voice
+        if voice is not None:
+            voice.feed(delta)
 
     def _emit_reset(self) -> None:
         """A tool round intervened: discard the partial caption."""
         self.bus.push_frame({"type": "answer.start"})
+        # Whatever we had begun saying was scaffolding, not the answer.
+        voice = self._voice
+        if voice is not None:
+            voice.abort()
 
     def _emit_tool(self, name: str, arguments: dict, result: dict) -> None:
         if self._run is not None:
@@ -228,6 +327,12 @@ class Orchestrator:
         try:
             turn_id = self.memory.add_turn(role, text, model=self.registry.model,
                                            latency_ms=latency_ms, origin=origin)
+            if role == "user":
+                # Name the conversation after its opening directive, so the
+                # archive reads as a list of topics rather than of timestamps.
+                # `title_session` only fills an empty title, so this is a
+                # no-op on every turn after the first.
+                self.memory.title_session(text)
             if role == "assistant":
                 self._fire("mem.write", 0.8)
             return turn_id
@@ -283,9 +388,21 @@ class Orchestrator:
             self.bus.push_frame({"type": "answer.start"})
             if isinstance(self.runtime, SimulatedRuntime):
                 self.runtime.model_hint = self.registry.model
+
+            # Open the voice ahead of generation so each sentence can be spoken
+            # as it closes. The stream stays silent until it is given one, so a
+            # directive answered entirely by tool calls costs nothing here.
+            voice = self.tts.open_stream(
+                on_first_audio=self._first_audio(run)
+            ) if self.registry.stream_speech else None
+            self._voice = voice
+
             try:
                 answer = await self.runtime.run(text)
             except Exception as exc:  # noqa: BLE001
+                self._voice = None
+                if voice is not None:
+                    await voice.cancel()
                 self.bus.publish("error", "workflow", f"crew failed: {type(exc).__name__}: {exc}")
                 if run is not None and self.metrics is not None:
                     run.error = type(exc).__name__
@@ -293,6 +410,8 @@ class Orchestrator:
                     self._run = None
                 await self._say("I ran into an error reaching the model. Check the telemetry log.")
                 return
+            finally:
+                self._voice = None
 
             elapsed = time.monotonic() - started
             if run is not None:
@@ -315,7 +434,14 @@ class Orchestrator:
             self._persist("assistant", answer, latency_ms=int(elapsed * 1000), origin=origin)
             self._fire("out.answer", "out.tts")
             self._broadcast_status("speaking", answer[:120])
-            await self.tts.speak(answer)
+            spoke = False
+            if voice is not None:
+                # Flush the tail sentence and hold until playback really ends.
+                spoke = await voice.finish()
+            if not spoke:
+                # Nothing streamed - streaming is off, the answer never closed a
+                # sentence, or a tool round discarded what we had begun.
+                await self.tts.speak(answer, on_first_audio=self._first_audio(run))
             self._fire("out.tts", "out.audio")
             if run is not None and self.metrics is not None:
                 run.spoken = time.monotonic()

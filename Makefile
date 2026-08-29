@@ -3,6 +3,7 @@
 #   make setup     one-time: python venv + npm install
 #   make backend   fastapi  -> http://localhost:8000
 #   make frontend  next.js  -> http://localhost:3000 (proxies /ws/* + /api/*)
+#   make test      unit checks that need no server
 #   make smoke     end-to-end check against a running backend
 #   make mcp       FastMCP tool server (stdio)
 #   make n8n       docker compose n8n automation instance -> :5678
@@ -16,7 +17,7 @@ FRONTEND_DIR := frontend
 # assistant to the robotic fallback synth. Pin 3.12 explicitly.
 PY_VERSION := 3.12
 
-.PHONY: setup setup-backend setup-frontend backend frontend smoke mcp n8n typecheck build clean-venv
+.PHONY: setup setup-backend setup-frontend backend frontend test smoke mcp n8n typecheck build clean-venv
 
 setup: setup-backend setup-frontend
 
@@ -56,6 +57,15 @@ backend:
 
 frontend:
 	cd $(FRONTEND_DIR) && PORT=3000 HOSTNAME=0.0.0.0 node server.mjs
+
+# Pure-logic checks - no server, no model, no audio device.
+test:
+	@set -e; cd $(BACKEND_DIR); \
+	./.venv/bin/python scripts/test_segmenter.py; \
+	echo; \
+	./.venv/bin/python scripts/test_speech_stream.py; \
+	echo; \
+	./.venv/bin/python scripts/test_guards.py
 
 smoke:
 	cd $(BACKEND_DIR) && ./.venv/bin/python scripts/smoke.py --url http://127.0.0.1:8000

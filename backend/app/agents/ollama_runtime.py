@@ -93,6 +93,30 @@ def _max_tool_rounds() -> int:
     return max(1, min(8, settings.tool_rounds))
 
 
+def _options(temperature: float, **extra: Any) -> dict[str, Any]:
+    """Sampling + runtime options sent with every chat request.
+
+    `num_ctx` is pinned rather than left to the server default so Ollama's
+    prompt cache actually hits between turns - a changing context size forces
+    a full re-evaluation of the prompt on every request. `num_predict` is a
+    seatbelt: a model that decides to write an essay should not hang the
+    assistant for a minute with nothing spoken.
+    """
+    options: dict[str, Any] = {"temperature": temperature, "top_p": 0.9}
+    if settings.num_ctx > 0:
+        options["num_ctx"] = settings.num_ctx
+    if settings.num_predict > 0:
+        options["num_predict"] = settings.num_predict
+    options.update(extra)
+    return options
+
+
+#: Transport failures worth retrying: the server was momentarily busy loading
+#: a model, or the socket was reaped. A protocol error (HTTPError) is not here
+#: on purpose - retrying a 400 just fails again.
+_TRANSIENT = (urllib.error.URLError, ConnectionError, TimeoutError, OSError)
+
+
 def _http_json(url: str, payload: dict | None = None, timeout: float = 5.0) -> Any:
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(
@@ -115,10 +139,11 @@ class StreamEvent:
 
 
 def _stream_chat(url: str, payload: dict) -> Iterator[StreamEvent]:
+    payload = {"keep_alive": settings.ollama_keep_alive, **payload}
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "Connection": "keep-alive"},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=settings.agent_step_timeout_s) as resp:
@@ -337,6 +362,41 @@ class OllamaRuntime:
                 )
         return True
 
+    # -- residency ---------------------------------------------------------------
+
+    async def preload(self, model: str | None = None) -> bool:
+        """Load the model into memory now, so the first directive does not.
+
+        An 8B model costs two to ten seconds to page in. Paying that at boot
+        (and again the moment the operator switches model) is the difference
+        between an assistant that answers in a second and one that appears to
+        have frozen the first time you talk to it.
+        """
+        target = model or self.model
+        if not target:
+            return False
+
+        def load() -> Any:
+            return _http_json(
+                f"{self.base_url}/api/chat",
+                {"model": target, "messages": [], "stream": False,
+                 "keep_alive": settings.ollama_keep_alive},
+                timeout=180.0,
+            )
+
+        started = time.monotonic()
+        try:
+            await asyncio.to_thread(load)
+        except Exception as exc:  # noqa: BLE001 - a cold model is not fatal
+            self.bus.publish("warn", "brain", f"could not preload {target}: {type(exc).__name__}")
+            return False
+        self.bus.publish(
+            "success", "brain",
+            f"{target} resident in {time.monotonic() - started:.1f}s "
+            f"(kept warm for {settings.ollama_keep_alive})",
+        )
+        return True
+
     # -- Runtime API -------------------------------------------------------------
 
     async def run(self, text: str) -> str:
@@ -424,7 +484,7 @@ class OllamaRuntime:
                 "model": self.model,
                 "stream": True,
                 "messages": messages,
-                "options": {"temperature": self._temperature(), "top_p": 0.9},
+                "options": _options(self._temperature()),
             }
             if tools:
                 payload["tools"] = tools
@@ -547,7 +607,7 @@ class OllamaRuntime:
                 )},
                 {"role": "user", "content": prompt},
             ],
-            "options": {"temperature": 0.4},
+            "options": _options(0.4),
         }
         self._apply_think(payload)
         self.bus.publish("info", f"agent/{persona.key}", f"thinking ({self.model})…")
@@ -555,6 +615,41 @@ class OllamaRuntime:
         turn = await asyncio.to_thread(self._consume, persona.key, payload, log_sentences, on_delta)
         self.bus.publish("info", f"agent/{persona.key}", f"step complete in {time.monotonic() - started:.1f}s")
         return strip_think(turn.answer)
+
+    def _open_stream(self, key: str, payload: dict) -> tuple[Iterator[StreamEvent], StreamEvent | None]:
+        """Start the chat stream, negotiating away rejected flags and retrying
+        transient transport failures.
+
+        Retrying is only safe here, before a single token has been handed to
+        the caller - once the answer has started streaming, a reconnect would
+        duplicate text into the caption and the voice.
+        """
+        url = f"{self.base_url}/api/chat"
+        attempts = max(1, settings.ollama_retries + 1)
+        for attempt in range(attempts):
+            try:
+                stream = _stream_chat(url, payload)
+                return stream, next(stream, None)
+            except urllib.error.HTTPError as exc:
+                # Some builds reject `think` (or `tools`) even when tags advertised them.
+                if exc.code == 400 and ("think" in payload or "tools" in payload):
+                    dropped = [k for k in ("think", "tools") if payload.pop(k, None) is not None]
+                    self.bus.publish(
+                        "warn", f"agent/{key}",
+                        f"server rejected {'/'.join(dropped)} - retrying without",
+                    )
+                    continue
+                raise
+            except _TRANSIENT as exc:
+                if attempt >= attempts - 1:
+                    raise
+                delay = 0.4 * (attempt + 1)
+                self.bus.publish(
+                    "warn", f"agent/{key}",
+                    f"ollama transport error ({type(exc).__name__}) - retry {attempt + 1}/{attempts - 1} in {delay:.1f}s",
+                )
+                time.sleep(delay)
+        raise RuntimeError("ollama stream could not be opened")
 
     def _consume(self, key: str, payload: dict, log_sentences: bool,
                  on_delta: Callable[[str], None] | None = None) -> Turn:
@@ -626,22 +721,7 @@ class OllamaRuntime:
                 flush_sentences()
 
         try:
-            try:
-                stream = _stream_chat(f"{self.base_url}/api/chat", payload)
-                first = next(stream, None)
-            except urllib.error.HTTPError as exc:
-                # Some builds reject `think` (or `tools`) even when tags advertised them.
-                retryable = exc.code == 400 and ("think" in payload or "tools" in payload)
-                if retryable:
-                    dropped = [k for k in ("think", "tools") if payload.pop(k, None) is not None]
-                    self.bus.publish(
-                        "warn", f"agent/{key}",
-                        f"server rejected {'/'.join(dropped)} - retrying without",
-                    )
-                    stream = _stream_chat(f"{self.base_url}/api/chat", payload)
-                    first = next(stream, None)
-                else:
-                    raise
+            stream, first = self._open_stream(key, payload)
             # `[first, *stream]` would materialise the whole generator before
             # the loop body ran even once, so every token arrived in one burst
             # at the end and nothing actually streamed. Chain it lazily.

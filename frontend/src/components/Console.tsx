@@ -5,8 +5,8 @@
  * saying (streamed token-by-token while the model generates), plus the
  * command bar - typed input, push-to-talk, and wake-word listening.
  *
- * Keyboard: "/" focuses the input, Esc stops speech (barge-in), and
- * Ctrl/Cmd+K toggles wake-word mode.
+ * Keyboard: "/" focuses the input, Esc stops speech (barge-in), Ctrl/Cmd+K
+ * toggles wake-word mode, and "?" opens the reference card.
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -22,6 +22,7 @@ const SUGGESTIONS = [
   "remember that I take my coffee black",
   "how much memory is this machine using right now",
   "remind me to stretch in 20 minutes",
+  "how many kilometres is a marathon",
   "be more concise",
   "performance report",
 ];
@@ -96,6 +97,13 @@ export default function Console() {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
         toggleWake();
+        return;
+      }
+      // "?" is the conventional key for "what can I press here" — but only
+      // when it is not simply a character being typed into the command bar.
+      if (event.key === "?" && !typing && !event.metaKey && !event.ctrlKey) {
+        event.preventDefault();
+        useJarvis.getState().setOverlay("help");
         return;
       }
       if (event.key === "/" && !typing) {

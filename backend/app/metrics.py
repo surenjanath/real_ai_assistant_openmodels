@@ -45,6 +45,8 @@ class Run:
     mode: str
     started: float = field(default_factory=time.monotonic)
     first_token: float | None = None
+    #: when the first PCM frame of the answer left the vocal engine
+    first_audio: float | None = None
     composed: float | None = None
     spoken: float | None = None
     chars: int = 0
@@ -57,6 +59,10 @@ class Run:
         if self.first_token is None:
             self.first_token = time.monotonic()
 
+    def mark_first_audio(self) -> None:
+        if self.first_audio is None:
+            self.first_audio = time.monotonic()
+
     @property
     def ttft_ms(self) -> int:
         return int(((self.first_token or self.composed or time.monotonic()) - self.started) * 1000)
@@ -66,10 +72,28 @@ class Run:
         return int(((self.composed or time.monotonic()) - self.started) * 1000)
 
     @property
+    def ttfa_ms(self) -> int | None:
+        """Time to the first *spoken* word - what the operator actually waits.
+
+        With streamed speech this is close to `ttft_ms`, because the first
+        sentence is voiced while the rest is still being written.
+        """
+        if self.first_audio is None:
+            return None
+        return int((self.first_audio - self.started) * 1000)
+
+    @property
     def voice_ms(self) -> int | None:
+        """Gap between the answer being composed and speech beginning.
+
+        Negative under streamed speech (we were already talking), so it is
+        clamped at zero rather than reported as a nonsense figure.
+        """
+        if self.first_audio is not None and self.composed is not None:
+            return max(0, int((self.first_audio - self.composed) * 1000))
         if self.spoken is None or self.composed is None:
             return None
-        return int((self.spoken - self.composed) * 1000)
+        return max(0, int((self.spoken - self.composed) * 1000))
 
     @property
     def tok_s(self) -> float:
@@ -87,6 +111,7 @@ class Run:
             "mode": self.mode,
             "kind": self.kind,
             "ttft_ms": self.ttft_ms,
+            "ttfa_ms": self.ttfa_ms,
             "total_ms": self.total_ms,
             "voice_ms": self.voice_ms,
             "tok_s": self.tok_s,
@@ -151,6 +176,7 @@ class Metrics:
             else (reasoning[-1] if reasoning else None)
         )
         ttfts = [float(r.ttft_ms) for r in reasoning]
+        ttfas = [float(r.ttfa_ms) for r in reasoning if r.ttfa_ms is not None]
         totals = [float(r.total_ms) for r in reasoning]
         rates = [r.tok_s for r in reasoning if r.tok_s > 0]
         return {
@@ -166,6 +192,11 @@ class Metrics:
                 "p95": round(_percentile(ttfts, 95)),
                 "last": headline.ttft_ms if headline else 0,
             },
+            "ttfa_ms": {
+                "p50": round(median(ttfas)) if ttfas else 0,
+                "p95": round(_percentile(ttfas, 95)),
+                "last": (headline.ttfa_ms or 0) if headline else 0,
+            },
             "total_ms": {
                 "p50": round(median(totals)) if totals else 0,
                 "p95": round(_percentile(totals, 95)),
@@ -178,8 +209,8 @@ class Metrics:
             },
             "last": latest.as_dict() if latest is not None else None,
             "history": [
-                {"ttft_ms": r.ttft_ms, "total_ms": r.total_ms, "tok_s": r.tok_s,
-                 "kind": r.kind, "error": bool(r.error)}
+                {"ttft_ms": r.ttft_ms, "ttfa_ms": r.ttfa_ms, "total_ms": r.total_ms,
+                 "tok_s": r.tok_s, "kind": r.kind, "error": bool(r.error)}
                 for r in list(self.runs)[-30:]
             ],
         }

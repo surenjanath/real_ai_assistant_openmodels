@@ -52,6 +52,22 @@ export const SCENE_THEMES: Record<string, ScenePalette> = {
     ring: "#ffc46a",
     dust: "#d9b382",
   },
+  violet: {
+    core: "#f6f1ff",
+    hot: "#c4aeff",
+    rim: "#6d4bd8",
+    ring: "#b198ff",
+    dust: "#a894d8",
+  },
+  // Not literally grey: a hologram with zero saturation reads as dead pixels
+  // rather than as light, so the core keeps the faintest cool cast.
+  mono: {
+    core: "#ffffff",
+    hot: "#dfe5ec",
+    rim: "#6d7683",
+    ring: "#c2cad6",
+    dust: "#9aa3af",
+  },
 };
 
 /** Live values the scene reads. Mutated in place — never reassigned. */

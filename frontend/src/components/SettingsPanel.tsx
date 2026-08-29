@@ -21,7 +21,9 @@
 
 import { useEffect, useState } from "react";
 import { audioEngine } from "@/audio/engine";
+import { pullModel } from "@/hooks/useJarvisConnection";
 import { THEMES, useJarvis, type Theme } from "@/state/jarvis";
+import { PROFILES, TIERS, quality, resetQuality, setQuality, type Quality } from "@/state/quality";
 import type { LogLevel } from "@/lib/protocol";
 
 type SaveState = "idle" | "saving" | "ok" | "error";
@@ -42,6 +44,11 @@ export default function SettingsPanel() {
   const [save, setSave] = useState<SaveState>("idle");
   const [detail, setDetail] = useState("");
   const [muted, setMuted] = useState(false);
+  const pull = useJarvis((s) => s.pull);
+  // The tier lives in a mutable singleton so the WebGL tree never re-renders
+  // for it; this mirror exists purely to repaint the buttons below.
+  const [tier, setTier] = useState<Quality>(quality.tier);
+  const [tierAuto, setTierAuto] = useState(quality.auto);
 
   useEffect(() => {
     if (!open) return;
@@ -63,6 +70,7 @@ export default function SettingsPanel() {
     tools?: boolean;
     recall?: boolean;
     volume?: number;
+    stream_speech?: boolean;
   }) => {
     setSave("saving");
     setDetail("");
@@ -164,6 +172,21 @@ export default function SettingsPanel() {
                 </optgroup>
               )}
             </select>
+            {!settings.model_verified && settings.model && (
+              <button
+                type="button"
+                className="settings-action"
+                disabled={Boolean(pull)}
+                onClick={() => {
+                  void pullModel(settings.model);
+                  pushLog("info", "models", `requested download of ${settings.model}`);
+                }}
+              >
+                {pull
+                  ? `pulling ${pull.model}${typeof pull.percent === "number" ? ` · ${pull.percent}%` : "…"}`
+                  : `↓ install ${settings.model}`}
+              </button>
+            )}
           </label>
 
           <label className="settings-field">
@@ -306,6 +329,74 @@ export default function SettingsPanel() {
                 disabled={save === "saving" || !settings.tools_supported}
               >
                 ON · armed
+              </button>
+            </div>
+          </label>
+
+          <label className="settings-field">
+            <span className="settings-label">
+              SPEECH START
+              <em className="settings-note">
+                {settings.stream_speech
+                  ? "speaks each sentence as it is written"
+                  : "waits for the whole answer first"}
+              </em>
+            </span>
+            <div className="toggle-row">
+              <button
+                type="button"
+                className={`toggle ${!settings.stream_speech ? "on" : ""}`}
+                onClick={() => apply({ stream_speech: false })}
+                disabled={save === "saving"}
+              >
+                OFF · whole answer
+              </button>
+              <button
+                type="button"
+                className={`toggle ${settings.stream_speech ? "on" : ""}`}
+                onClick={() => apply({ stream_speech: true })}
+                disabled={save === "saving"}
+              >
+                ON · per sentence
+              </button>
+            </div>
+          </label>
+
+          <label className="settings-field">
+            <span className="settings-label">
+              RENDER QUALITY
+              <em className="settings-note">
+                {PROFILES[tier].particles.toLocaleString()} particles
+                {tierAuto ? " · chosen automatically" : " · set by you"}
+                {quality.fps ? ` · ${quality.fps} fps` : ""}
+              </em>
+            </span>
+            <div className="toggle-row">
+              {TIERS.map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  className={`toggle ${tier === option ? "on" : ""}`}
+                  onClick={() => {
+                    setQuality(option);
+                    setTier(option);
+                    setTierAuto(false);
+                  }}
+                >
+                  {PROFILES[option].label}
+                </button>
+              ))}
+              <button
+                type="button"
+                className={`toggle ${tierAuto ? "on" : ""}`}
+                title="Pick from the hardware and correct it from the measured frame rate"
+                onClick={() => {
+                  resetQuality();
+                  setTier(quality.tier);
+                  setTierAuto(true);
+                }}
+              >
+                auto
               </button>
             </div>
           </label>
