@@ -65,9 +65,13 @@ function MindTab() {
     setBusy(false);
   }, []);
 
+  // `memoryVersion` ticks on every `memory.changed` frame, so a fact stored by
+  // voice while this tab is open appears without a reload. It is the same
+  // signal the archive watches, and this tab was simply not listening.
+  const memoryVersion = useJarvis((s) => s.memoryVersion);
   useEffect(() => {
     void reload();
-  }, [reload]);
+  }, [reload, memoryVersion]);
 
   const search = async (event: React.FormEvent) => {
     event.preventDefault();

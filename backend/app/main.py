@@ -93,6 +93,15 @@ except Exception as exc:  # noqa: BLE001 - a broken store must not stop the boot
     _memory = None
     print(f"[   warn] memory        store unavailable: {type(exc).__name__}: {exc}", flush=True)
 
+if _memory is not None:
+    # Any durable write - by voice, by skill, or over REST - tells every open
+    # client. Without this the MIND tab showed whatever was true when it was
+    # opened: you could say "remember that…", watch it be stored in the log,
+    # and still not find it under FACTS until the page was reloaded.
+    _memory.on_change = lambda reason: _bus.push_frame(
+        {"type": "memory.changed", "reason": reason}
+    )
+
 _kit = SkillKit(_memory, vitals_provider=lambda: _vitals.latest) if _memory else None
 _orchestrator = Orchestrator(
     _bus, _tts, _registry, memory=_memory, kit=_kit, neural=_neural, metrics=_metrics,

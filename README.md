@@ -1,29 +1,93 @@
-# Project J.A.R.V.I.S.
+<div align="center">
 
-A locally hosted, privacy-first, agentic AI assistant with an audio-reactive
-holographic interface and a high-speed multi-agent backend.
+# J.A.R.V.I.S.
 
-- **Interface** — dark, minimalist, geometric: a wireframe icosahedron cage
-  around a 24,000-point particle sphere displaced on the GPU by live speech
-  frequencies, ringed by an FFT spectrum, an oscilloscope of the waveform,
-  tick-marked instrument rings and orbiting satellites; live host vitals on the
-  left, telemetry terminal on the right, spoken captions along the bottom.
-- **Neural system** — the assistant's own cognitive architecture, drawn as a
-  living network: every subsystem is a node, every hand-off an edge, and real
-  action potentials travel the synapses as a directive passes through. Nothing
-  pulses unless that code path actually ran.
-- **Backend** — FastAPI nervous system streaming telemetry, real host metrics,
-  neural activation and raw TTS audio over WebSockets, orchestrating local
-  Ollama models with native tool calling, durable on-device memory and a
-  deterministic reflex arc; plus an n8n + FastMCP automation bridge.
-- **Voice** — Kokoro-82M via `pykokoro` (ONNX, Core ML capable), streamed
-  sentence-by-sentence as int16 PCM to the browser, driving the Web Audio
-  analyser that animates the hologram.
+**A locally hosted, voice-first AI assistant with an audio-reactive holographic
+interface — running entirely on your own machine.**
+
+No cloud. No API keys. Nothing leaves the laptop.
+
+<img src="docs/media/hero.png" alt="The J.A.R.V.I.S. interface answering a directive" width="100%">
+
+</div>
+
+---
+
+## It talks back
+
+Type or speak a directive; the answer is spoken as it is written, with the
+particle sphere driven by the live speech frequencies. Below, one directive end
+to end — the model reasoning, the first sentence reaching the vocal engine
+before the answer is finished, and the hologram reacting to the audio actually
+playing.
+
+<div align="center">
+  <img src="docs/media/demo.gif" alt="A directive being answered end to end" width="100%">
+</div>
+
+<div align="center">
+
+**▶ [Watch the full 25-second run](docs/media/demo.mp4)** — three directives
+back to back, including the reflex arc grounding a date question before the
+model ever sees it.
+
+</div>
+
+---
+
+## What it is
+
+| | |
+| --- | --- |
+| **Interface** | A wireframe icosahedron around a 24,000-point particle sphere, displaced on the GPU by live speech frequencies — ringed by an FFT spectrum, an oscilloscope, instrument rings and orbiting satellites. Host vitals left, telemetry right, spoken captions along the bottom. |
+| **Brain** | Local Ollama models with native tool calling, 29 skills, durable on-device memory, and a deterministic reflex arc for the things a model is confidently wrong about. |
+| **Voice** | Kokoro-82M via `pykokoro` (ONNX, Core ML capable), streamed sentence-by-sentence as int16 PCM to the browser — so it starts speaking before it has finished thinking. |
+| **Ears** | Browser speech recognition with its own endpointer, acoustic echo cancellation so it never answers its own voice, and true barge-in: talk over it and it stops. |
+| **Nervous system** | FastAPI streaming telemetry, real host metrics, neural activation and raw audio over WebSockets. Every subsystem is a node on a cognitive map, and nothing pulses unless that code path actually ran. |
 
 Everything degrades gracefully: with **zero optional dependencies** the full
 product loop still runs (simulated crew + dependency-free synth voice), so you
-can develop the interface on any machine and enable the real engines on the
+can develop the interface on any machine and switch on the real engines on the
 target hardware.
+
+---
+
+## A look around
+
+<table>
+<tr>
+<td width="50%"><img src="docs/media/idle.png" alt="The interface at rest"></td>
+<td width="50%"><img src="docs/media/cognitive-map.png" alt="The cognitive map"></td>
+</tr>
+<tr>
+<td><b>At rest.</b> Host vitals and the neural cortex meters on the left, live
+telemetry on the right, the command bar below. The core breathes while idle.</td>
+<td><b>Cognitive map.</b> 19 nodes and 27 synapses. A node brightens while that
+subsystem is working, and a tool grows its own node the first time it is really
+called — a record of exercised capability, not a list of intentions.</td>
+</tr>
+<tr>
+<td><img src="docs/media/dispositions.png" alt="Editing a disposition"></td>
+<td><img src="docs/media/performance.png" alt="The performance view"></td>
+</tr>
+<tr>
+<td><b>Dispositions.</b> Seven ship with it — butler, terse, engineer, socratic,
+warm, furious, Trinidadian — each with its own voice. Edit any of them, or write
+your own.</td>
+<td><b>Performance.</b> p50/p95 time to first spoken word, tokens per second,
+and a run history separating <i>waiting</i> from <i>generating</i>. Measured
+around real model calls, never estimated.</td>
+</tr>
+<tr>
+<td><img src="docs/media/archive.png" alt="The archive"></td>
+<td><img src="docs/media/reference.png" alt="The reference card"></td>
+</tr>
+<tr>
+<td><b>Archive.</b> Every past conversation, searchable, plus an audit trail of
+every skill this machine has ever run.</td>
+<td><b>Reference.</b> Shortcuts and spoken phrases, one keypress away (<code>?</code>).</td>
+</tr>
+</table>
 
 ---
 
@@ -51,6 +115,39 @@ particle sphere reacting to the audio in real time.
 The first launch downloads the Kokoro weights (~330 MB) into the Hugging Face
 cache and warms the ONNX session in the background — the log says
 `vocal engine warm in …` when speech is ready.
+
+<img src="docs/media/settings.png" alt="The settings panel" width="100%">
+
+Everything is live from the settings panel (`⚙` under the vitals, or just say
+*"settings"*): model, voice, disposition, skills, memory, speech and render
+quality. Models Ollama actually has installed are shown separately from mere
+suggestions, because picking an un-pulled tag is the easiest way to end up with
+a crew that cannot answer.
+
+---
+
+## Contents
+
+**Making it fast** · [Extended thinking is off](#speed-extended-thinking-is-off-by-default) · [It stops waiting for the recogniser](#speed-it-stops-waiting-for-the-recogniser-to-make-up-its-mind) · [Speaking before it finishes thinking](#speed-the-assistant-speaks-before-it-has-finished-thinking) · [Tools are not free](#tools-are-not-free-and-only-the-relevant-ones-are-attached)
+
+**Getting it right** · [The reflex arc](#the-reflex-arc) · [Two things that must never be approximated](#two-things-that-must-never-be-approximated) · [It does not answer its own voice](#it-does-not-answer-its-own-voice--and-you-can-talk-over-it)
+
+**What it can do** · [Skills](#skills--things-it-can-actually-do) · [Memory](#memory-that-survives-a-restart) · [Dispositions](#dispositions) · [Voice control](#voice-control) · [The neural system](#the-neural-system)
+
+**Running it** · [What runs where](#what-runs-where) · [Enabling the real stack](#enabling-the-real-stack-macos--apple-silicon) · [Configuration](#configuration-env) · [WebSocket protocol](#websocket-protocol)
+
+> Much of what follows is **measured rather than asserted** — timings, token
+> counts and tool-call rates from real runs on one machine, with the failures
+> that motivated each fix written down next to it. Where a number appears, it
+> came from an experiment in this repository.
+
+---
+
+## Making it fast
+
+A voice assistant lives or dies on the gap between you finishing a sentence and
+it starting one. Four things were in the way, and each was measured before and
+after.
 
 ### Speed: extended thinking is off by default
 
@@ -715,6 +812,18 @@ refuse to escape the workspace or read credentials, that a stored fact survives
 a round-trip through recall, and that the reflex arc grounds large arithmetic
 exactly while staying silent on questions with nothing to compute. Memory
 probes clean up after themselves, so running it does not pollute your store.
+
+## Screenshots and the demo loop
+
+Everything in `docs/media/` was captured from this repository actually running —
+headless Chrome driven over the DevTools protocol against the live backend, with
+`--use-angle=metal` so the WebGL hologram renders rather than coming out blank.
+The numbers visible in the telemetry and instrument panels are real readings from
+those runs, not mock-ups. On a real GPU it looks better than this.
+
+`demo.mp4` is the fuller run (1100 px, 25 s, three directives); `demo.gif` is the
+first of them, kept short because GitHub renders a GIF inline and a video only as
+a link.
 
 ## What runs where
 

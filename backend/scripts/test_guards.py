@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -227,6 +228,56 @@ with tempfile.TemporaryDirectory() as tmp:
           {h.role for h in everything} == {"user", "assistant"},
           f"got roles {[h.role for h in everything]}")
     view.close()
+
+# --------------------------------------------- durable writes announce themselves
+
+print("\n-- a durable change tells the interface --")
+
+# The MIND tab used to read facts, notes and reminders once when it was opened
+# and never again, and nothing announced a *write* anyway - only deletes and
+# wipes did. So you could say "remember that…", watch the log confirm it was
+# stored, and still not find it under FACTS until the page was reloaded.
+_m = Memory(Path(tempfile.mkdtemp()) / "memory.db")
+_seen: list[str] = []
+_m.on_change = _seen.append
+
+_m.remember_fact("lucky number", "my lucky number is seventeen")
+check("storing a fact announces it", _seen == ["fact.set"], f"got {_seen}")
+
+_seen.clear(); _note = _m.add_note("rewire the proxy")
+check("adding a note announces it", _seen == ["note.add"], f"got {_seen}")
+_seen.clear(); _m.delete_note(_note)
+check("deleting a note announces it", _seen == ["note.delete"], f"got {_seen}")
+
+_seen.clear(); _rem = _m.add_reminder("stretch", time.time() + 600)
+check("setting a reminder announces it", _seen == ["reminder.add"], f"got {_seen}")
+_seen.clear(); _m.cancel_reminder(_rem)
+check("cancelling one announces it", _seen == ["reminder.cancel"], f"got {_seen}")
+
+_seen.clear(); _m.forget_fact("lucky number")
+check("forgetting a fact announces it", _seen == ["fact.forget"], f"got {_seen}")
+
+# A delete that removed nothing is not a change; firing anyway would have
+# every open tab reload for nothing.
+_seen.clear(); _m.forget_fact("never stored"); _m.delete_note(9999)
+check("a no-op delete announces nothing", _seen == [], f"got {_seen}")
+
+# The transcript already streams live. One notification per turn would be
+# constant noise for a list that does not show turns at all.
+_seen.clear(); _m.add_turn("user", "hello")
+check("an ordinary turn stays quiet", _seen == [], f"got {_seen}")
+
+# A listener that throws must not cost the operator the write.
+_m.on_change = lambda reason: (_ for _ in ()).throw(RuntimeError("boom"))
+_stored = True
+try:
+    _m.remember_fact("resilient", "still saved")
+except Exception:
+    _stored = False
+check("a broken listener never breaks the write", _stored)
+check("...and the fact is really there", _m.recall_fact("resilient") == "still saved")
+
+_m.close()
 
 # ------------------------------------------------------- dispositions
 

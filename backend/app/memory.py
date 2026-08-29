@@ -29,7 +29,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -126,6 +126,13 @@ class Recollection:
 class Memory:
     """Durable store. One connection, guarded by SQLite's own locking."""
 
+    #: Called with a short reason whenever the durable store *gains or loses*
+    #: something the interface displays. Wired to the log bus in `main.py`, so
+    #: an open MIND tab reloads instead of showing a list that was true when it
+    #: was opened. Deliberately not fired by `add_turn`: the transcript already
+    #: streams live, and a notification per turn would be constant noise.
+    on_change: Callable[[str], None] | None = None
+
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or (data_dir() / "jarvis.db")
         self.db = sqlite3.connect(self.path, check_same_thread=False)
@@ -136,6 +143,16 @@ class Memory:
         self.fts = self._try_fts()
         self.db.commit()
         self.session_id = self._open_session()
+
+    def _changed(self, reason: str) -> None:
+        """Announce a durable change. Never lets a listener break a write."""
+        hook = self.on_change
+        if hook is None:
+            return
+        try:
+            hook(reason)
+        except Exception:  # noqa: BLE001 - a broken listener is not a failed write
+            pass
 
     def _try_fts(self) -> bool:
         try:
@@ -355,6 +372,7 @@ class Memory:
             (key, value.strip(), time.time()),
         )
         self.db.commit()
+        self._changed("fact.set")
 
     def recall_fact(self, key: str) -> str | None:
         key = key.strip().lower()
@@ -383,6 +401,8 @@ class Memory:
     def forget_fact(self, key: str) -> bool:
         cur = self.db.execute("DELETE FROM facts WHERE key=?", (key.strip().lower(),))
         self.db.commit()
+        if cur.rowcount:
+            self._changed("fact.forget")
         return cur.rowcount > 0
 
     # -- notes ---------------------------------------------------------------
@@ -392,6 +412,7 @@ class Memory:
             "INSERT INTO notes(text, tags, ts) VALUES (?,?,?)", (text.strip(), tags, time.time())
         )
         self.db.commit()
+        self._changed("note.add")
         return int(cur.lastrowid or 0)
 
     def list_notes(self, limit: int = 40) -> list[dict[str, Any]]:
@@ -403,6 +424,8 @@ class Memory:
     def delete_note(self, note_id: int) -> bool:
         cur = self.db.execute("DELETE FROM notes WHERE id=?", (note_id,))
         self.db.commit()
+        if cur.rowcount:
+            self._changed("note.delete")
         return cur.rowcount > 0
 
     # -- reminders -----------------------------------------------------------
@@ -413,6 +436,7 @@ class Memory:
             (text.strip(), due_ts, time.time()),
         )
         self.db.commit()
+        self._changed("reminder.add")
         return int(cur.lastrowid or 0)
 
     def due_reminders(self, now: float | None = None) -> list[dict[str, Any]]:
@@ -426,6 +450,7 @@ class Memory:
     def mark_fired(self, reminder_id: int) -> None:
         self.db.execute("UPDATE reminders SET fired=1 WHERE id=?", (reminder_id,))
         self.db.commit()
+        self._changed("reminder.fired")
 
     def pending_reminders(self, limit: int = 40) -> list[dict[str, Any]]:
         rows = self.db.execute(
@@ -438,6 +463,8 @@ class Memory:
     def cancel_reminder(self, reminder_id: int) -> bool:
         cur = self.db.execute("DELETE FROM reminders WHERE id=?", (reminder_id,))
         self.db.commit()
+        if cur.rowcount:
+            self._changed("reminder.cancel")
         return cur.rowcount > 0
 
     # -- events (metrics / audit) ---------------------------------------------
